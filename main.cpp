@@ -23,7 +23,7 @@ int main(){
 
     srand(time(NULL));
     int noImproveCount = 0;
-    const int patience = 1;
+    const int patience = 500;
 
     // 讀檔
     Data parameters;
