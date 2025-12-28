@@ -20,7 +20,8 @@ bool isBetter(const Individual& a, const Individual& b) {
 }
 
 int main(){
-
+    using Clock = std::chrono::high_resolution_clock;
+    auto t_start = Clock::now();
     srand(time(NULL));
     int noImproveCount = 0;
     const int patience = 500;
@@ -158,5 +159,8 @@ int main(){
         }
         
     }
+    auto t_end = Clock::now();
+    double total_sec = std::chrono::duration<double>(t_end - t_start).count();
+    cout << "\nTotal runtime: " << total_sec << " seconds\n";
     return 0;
 }
