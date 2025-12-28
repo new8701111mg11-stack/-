@@ -1,4 +1,4 @@
-# include <iostream>
+#include <iostream>
 #include <vector>
 #include <chrono>
 #include "data.h"
@@ -27,8 +27,15 @@ int main(){
     const int patience = 500;
 
     // 讀檔
+    string folder = "datasets/N12_A4_S20250102";
     Data parameters;
-    readParameters("customerInfo.csv", "goods.csv", "serviceArea.csv", "routes.csv", parameters);
+    readParameters(
+    folder + "/customerInfo.csv",
+    folder + "/goods.csv",
+    folder + "/serviceArea.csv",
+    folder + "/routes.csv",
+    parameters
+);
     
     // 編碼 & 初始母體生成
     vector<Individual> population = initializePopulation(populationSize, parameters);
