@@ -173,7 +173,7 @@ num_customers = 12
 num_areas = 4
 max_goods_per_customer = 3
 
-num_datasets = 1          # 你要一次產生幾筆
+num_datasets = 10          # 你要一次產生幾筆
 base_seed = 20250101       # 固定起始 seed（方便可重現）
 out_root = "datasets"      # 全部輸出到 datasets/ 底下
 
