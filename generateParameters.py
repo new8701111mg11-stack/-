@@ -169,7 +169,7 @@ def generate_one_dataset(num_customers, num_areas, max_goods_per_customer, seed=
 # =========================
 # 主程式：一次生成多筆同情境資料
 # =========================
-num_customers = 12
+num_customers = 24
 num_areas = 4
 max_goods_per_customer = 3
 
