@@ -19,7 +19,7 @@ def generate_customer_goods(num_customers, max_goods_per_customer=3):
     for customer_id in range(1, num_customers + 1):
         num_goods = random.randint(1, max_goods_per_customer)
         for good_id in range(1, num_goods + 1):
-            length, width, height = random.choice(item_dimensions)
+            length,width,height =random.choice(item_dimensions)
             volume = length * width * height
 
             orientation_flags = [0] * 6
@@ -169,11 +169,11 @@ def generate_one_dataset(num_customers, num_areas, max_goods_per_customer, seed=
 # =========================
 # 主程式：一次生成多筆同情境資料
 # =========================
-num_customers = 84
+num_customers = 13
 num_areas = 4
-max_goods_per_customer = 3
+max_goods_per_customer = 5
 
-num_datasets = 10          # 你要一次產生幾筆
+num_datasets = 1         # 你要一次產生幾筆
 base_seed = 20250101       # 固定起始 seed（方便可重現）
 out_root = "datasets"      # 全部輸出到 datasets/ 底下
 
