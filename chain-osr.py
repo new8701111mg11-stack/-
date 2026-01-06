@@ -74,7 +74,7 @@ def plot_vehicle_stacks(vehicle_stacks, L, W, H):
 
 model = Model("ChainOsr")
 Z = 4   # 區域數量
-N = 12  # 客戶數量
+N = 60  # 客戶數量
 N0 = 49 # 節點數量(包含倉庫和客戶節點)
 O = 6   # 旋轉方向
 L, W, H = 300,170,165  #貨櫃長寬高
@@ -94,7 +94,7 @@ Neb = defaultdict(set)  #在非重疊服務區域 b 內的客戶集合
 Nobb1 = defaultdict(list) #在服務區域 b 和 b+1 重疊部分內的客戶集合
 Nb = defaultdict(list)   #在服務區域b的預定義之車輛路線的節點，沒有倉庫
 Ab = defaultdict(list)    #所有已完成路線的弧線集合
-base_dir = r"datasets/N12_A4_S20250102" 
+base_dir = r"datasets/N60_A4_S20250102" 
 
 with open(os.path.join(base_dir, "customerInfo.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
