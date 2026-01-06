@@ -573,8 +573,148 @@ for b in range(1, Z + 1):  # 假設 Z 是區域總數
                 z_val = z[i, t].X if (i, t) in z else None
                 if x_val is not None and y_val is not None and z_val is not None:
                     print(f"客戶 {i} 的貨物 {t}: x={x_val:.1f}, y={y_val:.1f}, z={z_val:.1f}")
+                
+print("\n==============================")
+print(" Solution Check Prints (26/3/4/5)")
+print("==============================")
 
+# 0) 狀態與目標值
+status = model.Status
+print("Model status =", status)
+if status == GRB.OPTIMAL:
+    print("Objective =", model.ObjVal)
+elif status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+    print("Infeasible. (Suggestion) compute IIS:")
+    print("  model.computeIIS(); model.write('case.ilp')")
+    # 你也可以直接打開這兩行跑 IIS：
+    # model.computeIIS()
+    # model.write("case.ilp")
+    raise SystemExit
 
+# ------------------------------------------------
+# (26) omega：是否外包/超長放鬆（你要看哪些客戶被拉成 1）
+# ------------------------------------------------
+print("\n(26) omega[i] (outsourcing / relax length):")
+omega_ones = []
+try:
+    for i in omega.keys():
+        if omega[i].X > 0.5:
+            omega_ones.append(i)
+    print("omega=1 customers:", omega_ones if omega_ones else "None")
+except Exception as e:
+    print("omega not found / name mismatch:", e)
+
+# ------------------------------------------------
+# (3) delta：客戶指派到哪個區域/車
+#    你要看：每個客戶是否剛好指派一次、以及是否落在允許服務區域
+# ------------------------------------------------
+print("\n(3) delta[i,b] assignment:")
+try:
+    # 推出 customers 清單：用 delta 的 key 或 Gi 的 key 都行
+    # 這裡用 delta 的 key 最直觀
+    customers = sorted({i for (i, b) in delta.keys()})
+    areas = sorted({b for (i, b) in delta.keys()})
+
+    # 每個客戶被指派到哪個區域
+    assigned = {}
+    bad_multi = []
+    bad_none = []
+    for i in customers:
+        chosen = [b for b in areas if (i, b) in delta and delta[i, b].X > 0.5]
+        if len(chosen) == 1:
+            assigned[i] = chosen[0]
+        elif len(chosen) == 0:
+            bad_none.append(i)
+        else:
+            bad_multi.append((i, chosen))
+
+    print("Assigned area per customer (i -> b):")
+    for i in customers:
+        print(f"  {i} -> {assigned.get(i, None)}")
+
+    if bad_none:
+        print("  [FAIL] customers with no assigned area:", bad_none)
+    if bad_multi:
+        print("  [FAIL] customers assigned to multiple areas:", bad_multi)
+    if (not bad_none) and (not bad_multi):
+        print("  PASS: each customer assigned to exactly one area.")
+
+    # 允許服務區域檢核（如果你有 serviceAreas / allowedAreas）
+    # 你程式裡若有類似 allowedAreas[i] = set([...])，就可以直接檢查。
+    # 這裡提供通用寫法：如果你有 service_area_flags[i] = [0/1,...] 也能改。
+    if "allowedAreas" in globals():
+        bad_allowed = []
+        for i, b in assigned.items():
+            if b not in allowedAreas[i]:
+                bad_allowed.append((i, b, sorted(list(allowedAreas[i]))))
+        if bad_allowed:
+            print("  [FAIL] assigned area not allowed:")
+            for i, b, allow in bad_allowed:
+                print(f"    customer {i} assigned {b}, allowed={allow}")
+        else:
+            print("  PASS: assigned area within allowed set.")
+    else:
+        print("  NOTE: allowedAreas not found in code; skip 'allowed service area' check.")
+except Exception as e:
+    print("delta assignment check failed (name mismatch / key format):", e)
+
+# ------------------------------------------------
+# (4) psi & gamma：路由弧與先後關係
+#    你要看：選了哪些弧、gamma 是否變成一致的順序（同區域二選一）
+# ------------------------------------------------
+print("\n(4) psi[i,j,b] selected arcs (only print X=1):")
+try:
+    cnt = 0
+    for key in psi.keys():
+        if psi[key].X > 0.5:
+            print("  psi", key, "=1")
+            cnt += 1
+    if cnt == 0:
+        print("  (none)")
+except Exception as e:
+    print("psi not found / name mismatch:", e)
+
+print("\n(4/5) gamma[i,j] precedence (only print X=1 for i<j):")
+try:
+    cnt = 0
+    # 只印 i<j 避免重複
+    for (i, j) in gamma.keys():
+        if i < j and gamma[i, j].X > 0.5:
+            print(f"  gamma[{i},{j}] = 1")
+            cnt += 1
+    if cnt == 0:
+        print("  (none or all 0)")
+except Exception as e:
+    print("gamma not found / name mismatch:", e)
+
+# ------------------------------------------------
+# (5) 裝載：座標 x,y,z + 邊界檢查（粗略）
+#    你要看：是否有跑出位置、是否超出車廂、以及懸浮(模型通常允許)
+# ------------------------------------------------
+print("\n(5) packing coordinates & bounds check:")
+L, W, H = 300, 170, 165  # 你車廂尺寸
+out_of_box = []
+try:
+    # 你 x/y/z 的 key 可能是 (i,t) 或 (i,t,v) 之類
+    # 這裡假設至少有 (i,t) 這種維度
+    for key in x.keys():
+        xv = x[key].X
+        yv = y[key].X
+        zv = z[key].X
+        if xv < -1e-6 or yv < -1e-6 or zv < -1e-6 or xv > L + 1e-6 or yv > W + 1e-6 or zv > H + 1e-6:
+            out_of_box.append((key, xv, yv, zv))
+    if out_of_box:
+        print("  [FAIL] some items out of container bounds:")
+        for key, xv, yv, zv in out_of_box[:50]:
+            print(f"    item {key} -> ({xv:.2f}, {yv:.2f}, {zv:.2f})")
+    else:
+        print("  PASS: all (x,y,z) are within container range (rough).")
+except Exception as e:
+    print("x/y/z not found / key mismatch:", e)
+
+print("\nNOTE:")
+print(" - 目前只做『座標落點』的粗略邊界檢查；要完整驗證不重疊與 x+placed_L<=L 等，必須輸出每件貨物的旋轉後尺寸(placed_L/W/H)。")
+print("==============================\n")
 
 # print("\n=== 各區貨物材積總和")
 # for b in range(1, Z + 1):
