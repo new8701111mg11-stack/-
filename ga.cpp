@@ -137,7 +137,7 @@ void decodeCargoRotation(Individual &indiv, const Data &parameters,const unorder
             continue;
         }
         // 依照你原本的解碼規則
-        int decodedIndex = (gene.undecodedRotation % orientationCount);
+        int decodedIndex = (gene.undecodedRotation  % orientationCount);
         gene.decodedRotation = feasibleOrientations[decodedIndex];
     }
 }
@@ -203,7 +203,7 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
             seen.insert(gene.customerId);
 
             auto& cargoGroup = customerGrouped[gene.customerId];
-            if (loader.tryInsert(cargoGroup)) {
+            if (loader.tryInsert(cargoGroup,20)) {
                 truck.loadedVolume += parameters.totalVolume[gene.customerId - 1];
                 truck.assignedCargo.insert(truck.assignedCargo.end(), cargoGroup.begin(), cargoGroup.end());
                 isLoadedGlobal[gene.customerId] = true;
@@ -274,7 +274,7 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
             }
             if (cargoGroup.empty()) continue;
 
-            bool canLoad = loader.tryInsert(cargoGroup);
+            bool canLoad = loader.tryInsert(cargoGroup,20);
 
             if (canLoad) {
                 anyLoadedThisTruck = true;

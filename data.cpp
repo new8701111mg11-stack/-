@@ -6,6 +6,8 @@
 #include <vector>
 #include <stdexcept>
 #include <unordered_map>
+#include <random>
+#include <algorithm>
 
 using namespace std;
 
@@ -182,23 +184,45 @@ void printChromosomeInfo(const Individual& indiv){
 void BLPlacement3D::setCargoLookup(const unordered_map<int, unordered_map<int, Cargo>>& lookup) {
     cargoLookup = lookup;
 }
-bool BLPlacement3D::tryInsert(vector<Gene>& group) {
-    vector<Box> tempPlaced = placedBoxes;
-    for (auto& g : group) {
-        Box b = getBoxFromGene(g);
-        if (!placeBox(b, tempPlaced)) {
-            return false;
+bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
+    // 建議用 static，避免每次呼叫都重新 seed
+    static std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> rotDist(1, 6);
+
+    for (int t = 0; t < maxTries; ++t) {
+        std::vector<Box> tempPlaced = placedBoxes;
+        auto cand = group;  // 用 copy，失敗不污染原本 group
+
+        // 第 0 次用原本解；後面幾次開始抖：換順序/換方向
+        if (t > 0) {
+            std::shuffle(cand.begin(), cand.end(), rng);
+
+            for (auto& g : cand) {
+                g.undecodedRotation = rotDist(rng); // 1..6
+            }
         }
-        g.position[0] = b.x;
-        g.position[1] = b.y;
-        g.position[2] = b.z;
-        tempPlaced.push_back(b);
+
+        bool ok = true;
+        for (auto& g : cand) {
+            Box b = getBoxFromGene(g);
+            if (!placeBox(b, tempPlaced)) {
+                ok = false;
+                break;
+            }
+            g.position[0] = b.x;
+            g.position[1] = b.y;
+            g.position[2] = b.z;
+            tempPlaced.push_back(b);
+        }
+
+        if (ok) {
+            group = std::move(cand);
+            placedBoxes = std::move(tempPlaced);
+            return true;
+        }
     }
-
-    placedBoxes = tempPlaced; 
-    return true;
-} 
-
+    return false;
+}
 bool BLPlacement3D::placeBox(Box& box, const vector<Box>& currentBoxes) {
     vector<tuple<int, int, int>> anchorPoints = {{0, 0, 0}};
     for (const auto& b : currentBoxes) {

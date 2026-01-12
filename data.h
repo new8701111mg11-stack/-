@@ -11,7 +11,7 @@
 
 using namespace std;
 const int N = 61;
-const int Customer = 60;
+const int Customer = 12;
 const int regionNum = 4;
 const int selfOwnedTruck = regionNum;
 const int rentedTruck = regionNum;
@@ -80,7 +80,7 @@ class BLPlacement3D {
 
         BLPlacement3D(int L, int W, int H) : containerL(L), containerW(W), containerH(H) {}
         void setCargoLookup(const unordered_map<int, unordered_map<int, Cargo>>& lookup);       
-        bool tryInsert(vector<Gene>& group); 
+        bool tryInsert(vector<Gene>& group, int  maxTries); 
 
     private:
         Box getBoxFromGene(const Gene& g) {
