@@ -185,34 +185,57 @@ void BLPlacement3D::setCargoLookup(const unordered_map<int, unordered_map<int, C
     cargoLookup = lookup;
 }
 bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
-    // 建議用 static，避免每次呼叫都重新 seed
-    static std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<int> rotDist(1, 6);
+   static std::mt19937 rng(std::random_device{}());
 
     for (int t = 0; t < maxTries; ++t) {
         std::vector<Box> tempPlaced = placedBoxes;
-        auto cand = group;  // 用 copy，失敗不污染原本 group
+        auto cand = group;  // copy，失敗不污染 group
 
-        // 第 0 次用原本解；後面幾次開始抖：換順序/換方向
+        // 你原本的策略：後面幾次可選擇打散順序
         if (t > 0) {
             std::shuffle(cand.begin(), cand.end(), rng);
-
-            for (auto& g : cand) {
-                g.undecodedRotation = rotDist(rng); // 1..6
-            }
         }
 
         bool ok = true;
+
         for (auto& g : cand) {
-            Box b = getBoxFromGene(g);
-            if (!placeBox(b, tempPlaced)) {
+            // 1) 先準備要試的 rotation 清單：原本的先試，再試其他 5 個
+            int originalRot = g.undecodedRotation;
+            if (originalRot < 1 || originalRot > 6) originalRot = 1;
+
+            int rotList[6] = {1,2,3,4,5,6};
+
+            // 讓「原本 rotation」排第一個（優先保留原解）
+            std::swap(rotList[0], rotList[originalRot - 1]);
+
+            // 可選：把後面 5 個 rotation 隨機打散，提高探索
+            std::shuffle(rotList + 1, rotList + 6, rng);
+
+            bool placed = false;
+            Box placedBox;
+
+            // 2) 逐一試 rotation，能放就停
+            for (int k = 0; k < 6; ++k) {
+                g.undecodedRotation = rotList[k];
+
+                Box b = getBoxFromGene(g);
+                if (placeBox(b, tempPlaced)) {
+                    placed = true;
+                    placedBox = b;
+                    break; // ✅ 放下就停（你要的）
+                }
+            }
+
+            if (!placed) {
                 ok = false;
                 break;
             }
-            g.position[0] = b.x;
-            g.position[1] = b.y;
-            g.position[2] = b.z;
-            tempPlaced.push_back(b);
+
+            // 3) 成功放下：回寫位置 + 更新 tempPlaced
+            g.position[0] = placedBox.x;
+            g.position[1] = placedBox.y;
+            g.position[2] = placedBox.z;
+            tempPlaced.push_back(placedBox);
         }
 
         if (ok) {

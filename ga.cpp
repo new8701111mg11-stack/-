@@ -1,6 +1,8 @@
 // 處理GA相關程式，包括編碼、解碼、計算適應度等等
 #include "data.h"
 #include <vector>
+#include <fstream>
+#include <sstream>
 #include <random>
 #include <algorithm>
 #include <numeric>
@@ -12,10 +14,99 @@
 
 using namespace std;
 
-// 產生初始染色體，包含編碼
+struct SeedCustomer { int area; int omega; };
+
+struct SeedCargo {
+    int area;   // 0 if outsourced
+    int omega;  // 0/1
+    int rot;    // 1..6
+    int x, y, z;
+    int placedL, placedW, placedH; // ← 新增：用 CSV 的旋轉後尺寸
+};
+
+static inline void stripBOM(std::string& s) {
+    // UTF-8 BOM: EF BB BF
+    if (s.size() >= 3 &&
+        (unsigned char)s[0] == 0xEF &&
+        (unsigned char)s[1] == 0xBB &&
+        (unsigned char)s[2] == 0xBF) {
+        s.erase(0, 3);
+    }
+}
+
+std::unordered_map<int, SeedCustomer>
+readSeedCustomerCSV(const std::string& path) {
+    std::ifstream fin(path);
+    if (!fin) throw std::runtime_error("Cannot open " + path);
+
+    std::unordered_map<int, SeedCustomer> mp;
+
+    std::string line;
+    if (!std::getline(fin, line)) return mp;
+    stripBOM(line); // header
+
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string a,b,c;
+
+        std::getline(ss, a, ',');
+        std::getline(ss, b, ',');
+        std::getline(ss, c, ',');
+
+        int customer = std::stoi(a);
+        int area     = std::stoi(b);
+        int omega    = std::stoi(c);
+
+        mp[customer] = SeedCustomer{area, omega};
+    }
+    return mp;
+}
+
+std::unordered_map<long long, SeedCargo>
+readSeedCargoCSV(const std::string& path) {
+    std::ifstream fin(path);
+    if (!fin) throw std::runtime_error("Cannot open " + path);
+
+    // key = customer*1000 + cargo  (簡單做法，cargoId 不大)
+    std::unordered_map<long long, SeedCargo> mp;
+
+    std::string line;
+    if (!std::getline(fin, line)) return mp;
+    stripBOM(line); // header
+
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string sCust,sCargo,sArea,sOmega,sRot,sx,sy,sz;
+
+        std::getline(ss, sCust, ',');
+        std::getline(ss, sCargo, ',');
+        std::getline(ss, sArea, ',');
+        std::getline(ss, sOmega, ',');
+        std::getline(ss, sRot, ',');
+        std::getline(ss, sx, ',');
+        std::getline(ss, sy, ',');
+        std::getline(ss, sz, ',');
+
+        int customer = std::stoi(sCust);
+        int cargo    = std::stoi(sCargo);
+
+        long long key = (long long)customer * 1000LL + cargo;
+        mp[key] = SeedCargo{
+            std::stoi(sArea),
+            std::stoi(sOmega),
+            std::stoi(sRot),
+            std::stoi(sx),
+            std::stoi(sy),
+            std::stoi(sz)
+        };
+    }
+    return mp;
+}
 vector<Individual> initializePopulation(const int population_size, const Data& parameters) {
 
-    // 1. 先生成初始種群，Individual分別代表的是一條染色體，種群內會有 populationSize 個染色體
+   // 1. 先生成初始種群，Individual分別代表的是一條染色體，種群內會有 populationSize 個染色體
     vector<Individual> population;
     for (int i = 0; i < population_size; ++i) {
         Individual ind;
@@ -78,7 +169,6 @@ vector<Individual> initializePopulation(const int population_size, const Data& p
     }
     return population;
 }
-
 // 進行服務區域的解碼
 void decodeServiceArea(Individual &indiv, const Data &parameters) {
     for (auto &gene : indiv.chromosome) {
@@ -203,7 +293,7 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
             seen.insert(gene.customerId);
 
             auto& cargoGroup = customerGrouped[gene.customerId];
-            if (loader.tryInsert(cargoGroup,20)) {
+            if (loader.tryInsert(cargoGroup,50)) {
                 truck.loadedVolume += parameters.totalVolume[gene.customerId - 1];
                 truck.assignedCargo.insert(truck.assignedCargo.end(), cargoGroup.begin(), cargoGroup.end());
                 isLoadedGlobal[gene.customerId] = true;
@@ -274,7 +364,7 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
             }
             if (cargoGroup.empty()) continue;
 
-            bool canLoad = loader.tryInsert(cargoGroup,20);
+            bool canLoad = loader.tryInsert(cargoGroup,50);
 
             if (canLoad) {
                 anyLoadedThisTruck = true;
