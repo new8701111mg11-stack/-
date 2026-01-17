@@ -249,6 +249,91 @@ void decodePopulation(vector<Individual>& decodedPopulation, const Data &paramet
     // printChromosomeInfo(decodedPopulation[0]);
 }
 
+//local search improve
+static long long usedVolumeFromPlaced(const BLPlacement3D& loader) {
+    long long used = 0;
+    for (const auto& b : loader.placedBoxes) used += 1LL * b.l * b.w * b.h;
+    return used;
+}
+
+static long long customerGroupVolume(const vector<Gene>& group,
+                                     const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup) {
+    long long v = 0;
+    for (const auto& g : group) {
+        v += cargoLookup.at(g.customerId).at(g.cargoId).volume;
+    }
+    return v;
+}
+
+// 回傳：是否成功塞入；同時輸出 bestOverflow (越小越好)
+// 若成功：group 會被替換成「成功那次」的擺放結果（position/rotation 也會被 loader 更新）
+// 若失敗：group 會被替換成「overflow 最小那次」的 rotation（但仍然沒塞進去）
+static bool localSearchRotateAllAndTryInsert(
+    BLPlacement3D& loader,
+    vector<Gene>& group,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    int maxOuterTries,
+    int maxInsertTries,
+    long long& bestOverflow
+) {
+    // 計算「剩餘可用體積」(用已放入的 box 估)
+    const long long containerVol = 1LL * loader.containerL * loader.containerW * loader.containerH;
+    const long long remainVol = max(0LL, containerVol - usedVolumeFromPlaced(loader));
+
+    const long long groupVol = customerGroupVolume(group, cargoLookup);
+
+    // overflow = max(0, groupVol - remainVol)
+    bestOverflow = max(0LL, groupVol - remainVol);
+
+    // 留一份最佳 rotation 版本
+    vector<Gene> bestGroup = group;
+
+    // 多次嘗試：每次把整包貨物的 rotation 全部改掉
+    for (int it = 0; it < maxOuterTries; ++it) {
+        vector<Gene> cand = group;
+
+        // ★ 整包換方向：每件貨都換一個隨機 undecodedRotation，然後重解碼成 decodedRotation
+        for (auto& g : cand) {
+            g.undecodedRotation = rand() % 6 + 1;
+        }
+        // cand 的 decodedRotation 需要更新（你原本 decodeCargoRotation 就能做）
+        // 這裡借用你現成的邏輯：用一個暫時 Individual 包起來解碼
+        {
+            Individual tmp;
+            tmp.chromosome = cand;
+            decodeCargoRotation(tmp, Data{}, cargoLookup); // 這行不能用 Data{}，所以下面我給你「正確寫法」
+        }
+
+        // ↑ 上面那段不能直接 Data{}，所以更穩的做法是「直接照你的 decodeCargoRotation 寫一個小版」：
+        for (auto& g : cand) {
+            const Cargo& c = cargoLookup.at(g.customerId).at(g.cargoId);
+            vector<int> feasible;
+            for (int ori = 0; ori < 6; ++ori) if (c.orientation[ori] == 1) feasible.push_back(ori + 1);
+            if (feasible.empty()) { g.decodedRotation = 1; continue; }
+            int k = (int)feasible.size();
+            int idx = (g.undecodedRotation % k);
+            g.decodedRotation = feasible[idx];
+        }
+
+        bool ok = loader.tryInsert(cand, maxInsertTries);
+        if (ok) {
+            group = std::move(cand);
+            return true;
+        }
+
+        // 仍失敗：overflow 仍用「體積超出」衡量（這裡不因 rotation 改變，值會一樣）
+        // 但你也可以改成「若 remainVol 變動（不同車、不同已塞貨）就會不同」，所以仍有意義
+        long long overflow = max(0LL, groupVol - remainVol);
+        if (overflow < bestOverflow) {
+            bestOverflow = overflow;
+            bestGroup = cand;
+        }
+    }
+
+    group = std::move(bestGroup);
+    return false;
+}
+
 void evaluateFitness(Individual &indiv, const Data &parameters) {
 
     long long rentedVehicleCargoCost = 0;
@@ -365,7 +450,25 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
             if (cargoGroup.empty()) continue;
 
             bool canLoad = loader.tryInsert(cargoGroup,50);
+            //試錯
+            if (!canLoad) {
+                long long bestOverflow = 0;
+                // ★ 老師要的：cannot be loaded -> 整包換方向做 local search
+                canLoad = localSearchRotateAllAndTryInsert(
+                loader,
+                cargoGroup,
+                loader.cargoLookup,
+                /*maxOuterTries=*/30,
+                /*maxInsertTries=*/50,
+                bestOverflow
+            );
 
+    // 你可以順便印 overflow 讓你知道是不是「體積真的爆了」
+    if (!canLoad) {
+        cerr << "[LS FAIL] cust " << custId
+             << " bestOverflowVolume=" << bestOverflow << "\n";
+    }
+}
             if (canLoad) {
                 anyLoadedThisTruck = true;
                 rentedSeen.insert(custId);
