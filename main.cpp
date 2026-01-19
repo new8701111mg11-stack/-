@@ -98,18 +98,6 @@ static int checkTruckBoxes(const vector<Box>& boxes, int L, int W, int H, int tr
             }
         }
     }
-
-    // support 80%
-    for (const auto& b : boxes) {
-        if (!supported80(b, boxes)) {
-            ++viol;
-            if (verbose) {
-                cerr << "[VIOL] truck " << truckTag << " not supported: cust "
-                     << b.customerId << " cargo " << b.cargoId << "\n";
-            }
-        }
-    }
-
     return viol;
 }
 
@@ -194,10 +182,10 @@ int main(){
     auto t_start = Clock::now();
     srand(time(NULL));
     int noImproveCount = 0;
-    const int patience = 1000;
+    const int patience = 2000;
 
     // 讀檔
-    string folder = "datasets/N11_A4_S20250102";
+    string folder = "datasets/N11_A4_SS20250102";
     Data parameters;
     readParameters(
     folder + "/customerInfo.csv",

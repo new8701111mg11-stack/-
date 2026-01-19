@@ -271,7 +271,7 @@ bool BLPlacement3D::placeBox(Box& box, const vector<Box>& currentBoxes) {
 
     for (const auto& [ax, ay, az] : anchorPoints) {
         box.x = ax; box.y = ay; box.z = az;
-        if (isWithinContainer(box)&& !hasCollision(box, currentBoxes)&& isSupported(box, currentBoxes)) {
+        if (isWithinContainer(box)&& !hasCollision(box, currentBoxes)) {
             return true;
         }
     }
