@@ -11,7 +11,7 @@
 #include "ga.cpp"
 
 using namespace std;
-/*
+
 struct Box {
     int x, y, z;
     int l, w, h;
@@ -44,7 +44,105 @@ static bool supported80(const Box& b, const vector<Box>& boxes) {
     }
     return sup >= (long long)floor(0.8 * base);
 }
-*/
+
+template <class CargoGeneT>
+static Box geneToBox(const CargoGeneT& g,
+                     const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup) {
+    const Cargo& c = cargoLookup.at(g.customerId).at(g.cargoId);
+
+    int l = c.lwh[0], w = c.lwh[1], h = c.lwh[2];
+
+    // 如果你的欄位不是 decodedRotation，請把下面這行改成你的欄位名
+    int rot = g.decodedRotation;
+
+    switch (rot) {
+        case 1: l = c.lwh[0]; w = c.lwh[1]; h = c.lwh[2]; break;
+        case 2: l = c.lwh[0]; w = c.lwh[2]; h = c.lwh[1]; break;
+        case 3: l = c.lwh[1]; w = c.lwh[0]; h = c.lwh[2]; break;
+        case 4: l = c.lwh[1]; w = c.lwh[2]; h = c.lwh[0]; break;
+        case 5: l = c.lwh[2]; w = c.lwh[0]; h = c.lwh[1]; break;
+        case 6: l = c.lwh[2]; w = c.lwh[1]; h = c.lwh[0]; break;
+        default: break;
+    }
+
+    Box b;
+    b.customerId = g.customerId;
+    b.cargoId = g.cargoId;
+    b.x = g.position[0];
+    b.y = g.position[1];
+    b.z = g.position[2];
+    b.l = l; b.w = w; b.h = h;
+    return b;
+}
+
+static int checkTruckBoxes(const vector<Box>& boxes, int L, int W, int H, int truckTag, bool verbose=true) {
+    int viol = 0;
+
+    // bounds + collision
+    for (int i = 0; i < (int)boxes.size(); ++i) {
+        if (!inContainer(boxes[i], L, W, H)) {
+            ++viol;
+            if (verbose) {
+                cerr << "[VIOL] truck " << truckTag << " out of bounds: cust "
+                     << boxes[i].customerId << " cargo " << boxes[i].cargoId << "\n";
+            }
+        }
+        for (int j = i + 1; j < (int)boxes.size(); ++j) {
+            if (collide(boxes[i], boxes[j])) {
+                ++viol;
+                if (verbose) {
+                    cerr << "[VIOL] truck " << truckTag << " collision: ("
+                         << boxes[i].customerId << "," << boxes[i].cargoId << ") vs ("
+                         << boxes[j].customerId << "," << boxes[j].cargoId << ")\n";
+                }
+            }
+        }
+    }
+
+    // support 80%
+    for (const auto& b : boxes) {
+        if (!supported80(b, boxes)) {
+            ++viol;
+            if (verbose) {
+                cerr << "[VIOL] truck " << truckTag << " not supported: cust "
+                     << b.customerId << " cargo " << b.cargoId << "\n";
+            }
+        }
+    }
+
+    return viol;
+}
+
+static int checkIndividualPlacement(const Individual& ind,
+                                    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+                                    bool verbose=true) {
+    const int L = 300, W = 170, H = 165;
+    int viol = 0;
+
+    // self-owned trucks: 1..regionNum
+    for (int i = 1; i <= regionNum; ++i) {
+        vector<Box> boxes;
+        const Truck& t = ind.selfOwnedTrucks[i];
+        boxes.reserve(t.assignedCargo.size());
+        for (const auto& g : t.assignedCargo) {
+            boxes.push_back(geneToBox(g, cargoLookup));
+        }
+        viol += checkTruckBoxes(boxes, L, W, H, /*truckTag=*/i, verbose);
+    }
+
+    // rented trucks: 0..size-1 (tag 用 1000+idx 避免跟自有車混淆)
+    for (int k = 0; k < (int)ind.rentedTrucks.size(); ++k) {
+        vector<Box> boxes;
+        const Truck& t = ind.rentedTrucks[k];
+        boxes.reserve(t.assignedCargo.size());
+        for (const auto& g : t.assignedCargo) {
+            boxes.push_back(geneToBox(g, cargoLookup));
+        }
+        viol += checkTruckBoxes(boxes, L, W, H, /*truckTag=*/1000 + k, verbose);
+    }
+
+    return viol;
+}
 // GA 比較（你原本那個，保留）
 static bool isBetter(const Individual& a, const Individual& b) {
     const auto& fa = a.fitness;
@@ -96,10 +194,10 @@ int main(){
     auto t_start = Clock::now();
     srand(time(NULL));
     int noImproveCount = 0;
-    const int patience = 500;
+    const int patience = 1000;
 
     // 讀檔
-    string folder = "datasets/N12_A4_S20250102";
+    string folder = "datasets/N11_A4_S20250102";
     Data parameters;
     readParameters(
     folder + "/customerInfo.csv",
@@ -242,6 +340,16 @@ int main(){
         
     }
     
+    auto cargoLookUp2 = createCargoLookup(parameters);
+
+// 重要：globalBest 可能是 undecoded，先 decode 成「可檢查」版本
+    vector<Individual> one{globalBest};
+    decodePopulation(one, parameters, cargoLookUp2);
+    one[0].fitness.clear();
+    evaluateFitness(one[0], parameters);
+
+    int viol = checkIndividualPlacement(one[0], cargoLookUp2, /*verbose=*/true);
+    cout << "\n[CHECK] placement violations = " << viol << "\n";
    /*
    auto cargoLookup = createCargoLookup(parameters);
  

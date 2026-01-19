@@ -201,6 +201,8 @@ bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
         for (auto& g : cand) {
             // 1) 先準備要試的 rotation 清單：原本的先試，再試其他 5 個
             int originalRot = g.undecodedRotation;
+            
+
             if (originalRot < 1 || originalRot > 6) originalRot = 1;
 
             int rotList[6] = {1,2,3,4,5,6};
@@ -217,7 +219,7 @@ bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
             // 2) 逐一試 rotation，能放就停
             for (int k = 0; k < 6; ++k) {
                 g.undecodedRotation = rotList[k];
-
+                g.decodedRotation = rotList[k];
                 Box b = getBoxFromGene(g);
                 if (placeBox(b, tempPlaced)) {
                     placed = true;
@@ -248,17 +250,28 @@ bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
 }
 bool BLPlacement3D::placeBox(Box& box, const vector<Box>& currentBoxes) {
     vector<tuple<int, int, int>> anchorPoints = {{0, 0, 0}};
+    anchorPoints.reserve(1 + 3 * currentBoxes.size());
+
     for (const auto& b : currentBoxes) {
         anchorPoints.push_back({b.x + b.l, b.y, b.z});
         anchorPoints.push_back({b.x, b.y + b.w, b.z});
         anchorPoints.push_back({b.x, b.y, b.z + b.h});
     }
 
+    // ★ 讓它更像 bottom-left：z 最優先，再 y，再 x（或你也可用 x,y,z）
+    sort(anchorPoints.begin(), anchorPoints.end(),
+         [](const auto& a, const auto& b){
+            if (get<2>(a) != get<2>(b)) return get<2>(a) < get<2>(b); // z
+            if (get<1>(a) != get<1>(b)) return get<1>(a) < get<1>(b); // y
+            return get<0>(a) < get<0>(b);                             // x
+         });
+
+    // 可選：去重，避免重複嘗試同一點
+    anchorPoints.erase(unique(anchorPoints.begin(), anchorPoints.end()), anchorPoints.end());
+
     for (const auto& [ax, ay, az] : anchorPoints) {
-        box.x = ax;
-        box.y = ay;
-        box.z = az;
-        if (isWithinContainer(box) && !hasCollision(box, currentBoxes) ) {
+        box.x = ax; box.y = ay; box.z = az;
+        if (isWithinContainer(box)&& !hasCollision(box, currentBoxes)&& isSupported(box, currentBoxes)) {
             return true;
         }
     }
@@ -266,7 +279,10 @@ bool BLPlacement3D::placeBox(Box& box, const vector<Box>& currentBoxes) {
 }
 
 bool BLPlacement3D::isWithinContainer(const Box& b) {
-    return b.x + b.l <= containerL && b.y + b.w <= containerW && b.z + b.h <= containerH;
+   return b.x >= 0 && b.y >= 0 && b.z >= 0 &&
+       b.x + b.l <= containerL &&
+       b.y + b.w <= containerW &&
+       b.z + b.h <= containerH;
 }
 
 bool BLPlacement3D::hasCollision(const Box& b, const vector<Box>& boxes) {

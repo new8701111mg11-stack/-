@@ -439,7 +439,7 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
             int custId = notLoadedCustomer[cursor];
 
             if (rentedSeen.count(custId)) continue;
-
+            
             // 建 cargoGroup
             vector<Gene> cargoGroup;
             for (const auto& g : indiv.chromosome) {
@@ -674,7 +674,6 @@ void mutateServiceArea(Individual& indiv, const Data& parameters, double mutatio
             }
         }
     }
-
     // 2. 以顧客為單位處理：同一顧客只決定一次要不要突變
     unordered_set<int> visitedCustomers;
 
