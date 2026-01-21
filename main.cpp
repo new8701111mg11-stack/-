@@ -177,13 +177,29 @@ static int rotationToUndecodedRotation(const Cargo& c, int desiredDecodedRot) {
     return (pos == 0) ? k : pos;
 }
 */
+
+static double computeObj1_GurobiStyle(const Individual& ind, const Data& parameters, double C0) {
+    std::unordered_set<int> omegaSet; // 出現在 rentedTrucks 的客戶視為 omega=1
+    for (const auto& t : ind.rentedTrucks) {
+        for (const auto& g : t.assignedCargo) {
+            omegaSet.insert(g.customerId);
+        }
+    }
+
+    double obj1 = 0.0;
+    for (int cid : omegaSet) {
+        obj1 += C0 * (double)parameters.totalVolume[cid - 1];
+    }
+    return obj1;
+}
+
 int main(){
     using Clock = std::chrono::high_resolution_clock;
     auto t_start = Clock::now();
     srand(time(NULL));
     int noImproveCount = 0;
-    const int patience = 2000;
-
+    const int patience = 500;
+    double C0 = 6;
     // 讀檔
     string folder = "datasets/N11_A4_SS20250102";
     Data parameters;
@@ -199,7 +215,12 @@ int main(){
     vector<Individual> population = initializePopulation(populationSize, parameters);
     // printChromosomeInfo(population[0]);
     
-    
+    std::vector<std::pair<int, double>> obj1_improve_points;
+
+// 也可以順便記錄每一代的 best-so-far（畫折線比較平滑）
+    std::vector<std::pair<int, double>> obj1_best_so_far_series;
+
+    double bestObj1SoFar = std::numeric_limits<double>::infinity();
 
     Individual globalBest;
     bool hasGlobalBest = false;
@@ -239,6 +260,16 @@ int main(){
             hasGlobalBest = true;
             noImproveCount = 0;
             improvedThisGen = true;
+            double curObj1 = computeObj1_GurobiStyle(globalBest, parameters, C0);
+
+// 每一代都記 best-so-far（畫折線用）
+            if (curObj1 < bestObj1SoFar) bestObj1SoFar = curObj1;
+                obj1_best_so_far_series.push_back({generation, bestObj1SoFar});
+
+// 只有發生改善時才記「改善點」
+            if (improvedThisGen) {
+                obj1_improve_points.push_back({generation, curObj1});
+            }
         } else {
             ++noImproveCount;
         }
@@ -472,7 +503,7 @@ for (const auto& [cid, sc] : seedCustomer) {
     cout << "fitness[1] (rented cost, GA style)= " << rentedCost_GA << "\n";
 cout << "obj1 (Gurobi style: Σ C0*vi*omega)= " << obj1_GurobiStyle << "\n";
 */
-double C0 = 6;
+
 
 unordered_set<int> omegaSet; // GA 端視為 omega=1 的客戶：出現在 rentedTrucks 的客戶
 for (const auto& t : globalBest.rentedTrucks) {
@@ -491,9 +522,31 @@ cout << "\n[Gurobi-style obj1] Σ C0 * v_i * ω_i = " << obj1_gurobi_style << "\
 cout << "[omega customers] count = " << omegaSet.size() << " : ";
 for (int cid : omegaSet) cout << cid << " ";
 cout << "\n";
+
+
+
     auto t_end = Clock::now();
     double total_sec = std::chrono::duration<double>(t_end - t_start).count();
     cout << "\nTotal runtime: " << total_sec << " seconds\n";
+
+    {
+    std::ofstream fout("obj1_improve_points.csv");
+    fout << "generation,obj1\n";
+    for (auto &p : obj1_improve_points) {
+        fout << p.first << "," << p.second << "\n";
+    }
+}
+
+{
+    std::ofstream fout("obj1_best_so_far_series.csv");
+    fout << "generation,obj1_best_so_far\n";
+    for (auto &p : obj1_best_so_far_series) {
+        fout << p.first << "," << p.second << "\n";
+    }
+}
+
+std::cout << "\n[LOG] obj1 improve count = " << obj1_improve_points.size() << "\n";
+std::cout << "[LOG] wrote obj1_improve_points.csv and obj1_best_so_far_series.csv\n";
     return 0;
 
 }

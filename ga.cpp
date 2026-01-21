@@ -458,8 +458,8 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
                 loader,
                 cargoGroup,
                 loader.cargoLookup,
-                /*maxOuterTries=*/30,
-                /*maxInsertTries=*/50,
+                /*maxOuterTries=*/20,
+                /*maxInsertTries=*/30,
                 bestOverflow
             );
 
