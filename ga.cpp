@@ -14,6 +14,154 @@
 
 using namespace std;
 
+// ===== Helper: 把一台 Truck 內的 assignedCargo 全部重排（repack） =====
+static bool repackTruck(Truck& t,
+                        const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+                        int maxTriesInsert = 80)
+{
+    BLPlacement3D loader(t.length, t.width, t.height);
+    loader.setCargoLookup(cargoLookup);
+    loader.placedBoxes.clear();
+
+    // 把原本貨物抓出來（整包一起 repack）
+    vector<Gene> group = t.assignedCargo;
+
+    // 清掉舊位置（避免用到舊座標）
+    for (auto& g : group) {
+        g.position[0] = g.position[1] = g.position[2] = -1;
+    }
+
+    // tryInsert 會回寫 position / rotation（你已經做了 rotation 探索版）
+    bool ok = loader.tryInsert(group, maxTriesInsert);
+    if (!ok) return false;
+
+    t.assignedCargo = std::move(group);
+    return true;
+}
+
+// ===== Helper: 從 ind.rentedTrucks 裡收集某個客戶 cid 的所有 Gene（整包） =====
+static vector<Gene> collectCustomerGenesFromRented(const Individual& ind, int cid)
+{
+    vector<Gene> out;
+    for (const auto& rt : ind.rentedTrucks) {
+        for (const auto& g : rt.assignedCargo) {
+            if (g.customerId == cid) out.push_back(g);
+        }
+    }
+    return out;
+}
+
+// ===== Helper: 從 rentedTrucks 移除某客戶 cid 的所有 Gene =====
+static void removeCustomerFromRented(Individual& ind, int cid)
+{
+    for (auto& rt : ind.rentedTrucks) {
+        auto& v = rt.assignedCargo;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [&](const Gene& g){ return g.customerId == cid; }),
+                v.end());
+        // route 也順便移掉（如果你 route 只是顯示用）
+        rt.route.erase(std::remove(rt.route.begin(), rt.route.end(), cid), rt.route.end());
+    }
+
+    // 刪掉空的 rented truck（可選，但通常要做）
+    ind.rentedTrucks.erase(
+        std::remove_if(ind.rentedTrucks.begin(), ind.rentedTrucks.end(),
+                       [&](const Truck& t){ return t.assignedCargo.empty(); }),
+        ind.rentedTrucks.end()
+    );
+}
+
+// ===== 核心 Move：嘗試把 cid 從 rented -> 自有車 area =====
+static bool tryMoveRentedCustomerToSelfTruck(Individual& ind,
+                                            int cid, int area,
+                                            const Data& parameters,
+                                            const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
+{
+    // area 必須可行（服務區限制）
+    if (parameters.serviceRegion[cid - 1][area - 1] != 1) return false;
+
+    // 取出整包貨
+    vector<Gene> pack = collectCustomerGenesFromRented(ind, cid);
+    if (pack.empty()) return false;
+
+    Truck& selfT = ind.selfOwnedTrucks[area];
+
+    // 暫存，失敗要回復
+    auto backupSelf = selfT.assignedCargo;
+    auto backupRented = ind.rentedTrucks;
+
+    // 加到自有車（先加再 repack）
+    selfT.assignedCargo.insert(selfT.assignedCargo.end(), pack.begin(), pack.end());
+
+    // repack 自有車
+    if (!repackTruck(selfT, cargoLookup, /*maxTriesInsert=*/80)) {
+        // rollback
+        selfT.assignedCargo = std::move(backupSelf);
+        ind.rentedTrucks    = std::move(backupRented);
+        return false;
+    }
+
+    // 成功：從 rented 移除 cid
+    removeCustomerFromRented(ind, cid);
+
+    return true;
+}
+
+// ===== LS-A + LS-B：降低租用車入口 =====
+static void localSearchReduceRented(Individual& ind,
+                                   const Data& parameters,
+                                   const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
+{
+    // 反覆做直到沒有改善
+    bool improved = true;
+    while (improved) {
+        improved = false;
+
+        // ===== 先做 LS-A：租用客戶塞回自有車 =====
+        // 建 omega customers
+        unordered_set<int> omega;
+        for (const auto& rt : ind.rentedTrucks)
+            for (const auto& g : rt.assignedCargo)
+                omega.insert(g.customerId);
+
+        // 逐客戶嘗試
+        for (int cid : omega) {
+            // 先試「原服務區」：你如果有 decodedServiceArea 就用那個；沒有就先試所有可行區
+            for (int area = 1; area <= regionNum; ++area) {
+                if (tryMoveRentedCustomerToSelfTruck(ind, cid, area, parameters, cargoLookup)) {
+                    improved = true;
+                    break;
+                }
+            }
+            if (improved) break; // 先採用第一個成功 move（比較穩）
+        }
+        if (improved) continue;
+
+        // ===== 再做 LS-B：合併租用車 =====
+        // 嘗試把 j 車全部塞到 i 車，成功就刪 j
+        for (int i = 0; i < (int)ind.rentedTrucks.size(); ++i) {
+            for (int j = i + 1; j < (int)ind.rentedTrucks.size(); ++j) {
+                auto backup = ind.rentedTrucks;
+
+                // 把 j 的貨加到 i
+                auto& A = ind.rentedTrucks[i];
+                auto& B = ind.rentedTrucks[j];
+                A.assignedCargo.insert(A.assignedCargo.end(), B.assignedCargo.begin(), B.assignedCargo.end());
+
+                if (repackTruck(A, cargoLookup, 100)) {
+                    // 刪掉 B
+                    ind.rentedTrucks.erase(ind.rentedTrucks.begin() + j);
+                    improved = true;
+                    break;
+                } else {
+                    ind.rentedTrucks = std::move(backup);
+                }
+            }
+            if (improved) break;
+        }
+    }
+}
+
 struct SeedCustomer { int area; int omega; };
 
 struct SeedCargo {

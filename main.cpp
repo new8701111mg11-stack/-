@@ -198,7 +198,7 @@ int main(){
     auto t_start = Clock::now();
     srand(time(NULL));
     int noImproveCount = 0;
-    const int patience = 500;
+    const int patience = 250;
     double C0 = 6;
     // 讀檔
     string folder = "datasets/N11_A4_SS20250102";
@@ -236,6 +236,21 @@ int main(){
 
         for (size_t i = 0; i < population.size(); ++i) {
             evaluateFitness(population[i], parameters);
+        }
+
+        for (size_t i = 0; i < population.size(); ++i) {
+            evaluateFitness(population[i], parameters);
+
+    // 只針對「已經用了租用車」的個體做，省時間
+            if (!population[i].rentedTrucks.empty()) {
+                auto cargoLookup = createCargoLookup(parameters);
+
+                localSearchReduceRented(population[i], parameters, cargoLookup);
+
+        // LS 動完要重算 fitness（避免成本不同步）
+                population[i].fitness.clear();
+                evaluateFitness(population[i], parameters);
+            }
         }
 
         // ====== 這一代的最佳解 ======
