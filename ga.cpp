@@ -14,6 +14,12 @@
 
 using namespace std;
 
+enum ReduceOp {
+    opReinsertion = 0,   // rented -> self
+    opConsolidation = 1, // merge rented trucks
+    opExchange = 2       // swap rented<->self customer packs
+};
+
 // ===== Helper: 把一台 Truck 內的 assignedCargo 全部重排（repack） =====
 static bool repackTruck(Truck& t,
                         const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
@@ -107,61 +113,180 @@ static bool tryMoveRentedCustomerToSelfTruck(Individual& ind,
     return true;
 }
 
-// ===== LS-A + LS-B：降低租用車入口 =====
-static void localSearchReduceRented(Individual& ind,
-                                   const Data& parameters,
-                                   const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
-{
-    // 反覆做直到沒有改善
-    bool improved = true;
-    while (improved) {
-        improved = false;
-
-        // ===== 先做 LS-A：租用客戶塞回自有車 =====
-        // 建 omega customers
-        unordered_set<int> omega;
-        for (const auto& rt : ind.rentedTrucks)
-            for (const auto& g : rt.assignedCargo)
-                omega.insert(g.customerId);
-
-        // 逐客戶嘗試
-        for (int cid : omega) {
-            // 先試「原服務區」：你如果有 decodedServiceArea 就用那個；沒有就先試所有可行區
-            for (int area = 1; area <= regionNum; ++area) {
-                if (tryMoveRentedCustomerToSelfTruck(ind, cid, area, parameters, cargoLookup)) {
-                    improved = true;
-                    break;
-                }
-            }
-            if (improved) break; // 先採用第一個成功 move（比較穩）
-        }
-        if (improved) continue;
-
-        // ===== 再做 LS-B：合併租用車 =====
-        // 嘗試把 j 車全部塞到 i 車，成功就刪 j
-        for (int i = 0; i < (int)ind.rentedTrucks.size(); ++i) {
-            for (int j = i + 1; j < (int)ind.rentedTrucks.size(); ++j) {
-                auto backup = ind.rentedTrucks;
-
-                // 把 j 的貨加到 i
-                auto& A = ind.rentedTrucks[i];
-                auto& B = ind.rentedTrucks[j];
-                A.assignedCargo.insert(A.assignedCargo.end(), B.assignedCargo.begin(), B.assignedCargo.end());
-
-                if (repackTruck(A, cargoLookup, 100)) {
-                    // 刪掉 B
-                    ind.rentedTrucks.erase(ind.rentedTrucks.begin() + j);
-                    improved = true;
-                    break;
-                } else {
-                    ind.rentedTrucks = std::move(backup);
-                }
-            }
-            if (improved) break;
-        }
-    }
+static vector<Gene> collectCustomerGenesFromSelf(const Truck& t, int cid) {
+    vector<Gene> out;
+    for (const auto& g : t.assignedCargo)
+        if (g.customerId == cid) out.push_back(g);
+    return out;
 }
 
+static void removeCustomerFromSelf(Truck& t, int cid) {
+    auto& v = t.assignedCargo;
+    v.erase(remove_if(v.begin(), v.end(),
+                      [&](const Gene& g){ return g.customerId == cid; }),
+            v.end());
+    t.route.erase(remove(t.route.begin(), t.route.end(), cid), t.route.end());
+}
+
+static bool doReinsertionOnce(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup
+){
+    unordered_set<int> omega;
+    for (const auto& rt : ind.rentedTrucks)
+        for (const auto& g : rt.assignedCargo)
+            omega.insert(g.customerId);
+
+    for (int cid : omega) {
+        for (int area = 1; area <= regionNum; ++area) {
+            if (tryMoveRentedCustomerToSelfTruck(ind, cid, area, parameters, cargoLookup)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool doConsolidationOnce(
+    Individual& ind,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup
+){
+    for (int i = 0; i < (int)ind.rentedTrucks.size(); ++i) {
+        for (int j = i + 1; j < (int)ind.rentedTrucks.size(); ++j) {
+            auto backup = ind.rentedTrucks;
+
+            auto& A = ind.rentedTrucks[i];
+            auto& B = ind.rentedTrucks[j];
+            A.assignedCargo.insert(A.assignedCargo.end(), B.assignedCargo.begin(), B.assignedCargo.end());
+
+            if (repackTruck(A, cargoLookup, 100)) {
+                ind.rentedTrucks.erase(ind.rentedTrucks.begin() + j);
+                return true;
+            } else {
+                ind.rentedTrucks = std::move(backup);
+            }
+        }
+    }
+    return false;
+}
+
+static bool doExchangeOnce(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup
+){
+    // 1) 找 rented 客戶集合
+    unordered_set<int> omega;
+    for (const auto& rt : ind.rentedTrucks)
+        for (const auto& g : rt.assignedCargo)
+            omega.insert(g.customerId);
+    if (omega.empty()) return false;
+
+    // 2) 找一個 rented 客戶（你也可以改成隨機）
+    int cidR = *omega.begin();
+    vector<Gene> packR = collectCustomerGenesFromRented(ind, cidR);
+    if (packR.empty()) return false;
+
+    // 3) 找一台自有車 + 一個 self 客戶 cidS
+    for (int area = 1; area <= regionNum; ++area) {
+        Truck& selfT = ind.selfOwnedTrucks[area];
+
+        // selfT 裡有哪些客戶
+        unordered_set<int> selfCustomers;
+        for (auto& g : selfT.assignedCargo) selfCustomers.insert(g.customerId);
+        if (selfCustomers.empty()) continue;
+
+        for (int cidS : selfCustomers) {
+            // cidR 必須允許放到 area（服務限制）
+            if (parameters.serviceRegion[cidR - 1][area - 1] != 1) continue;
+
+            // ===== 交換開始：先備份 =====
+            Individual backup = ind;
+
+            // packS
+            vector<Gene> packS = collectCustomerGenesFromSelf(selfT, cidS);
+            if (packS.empty()) { ind = std::move(backup); continue; }
+
+            // (a) self 車移除 cidS，加入 cidR
+            removeCustomerFromSelf(selfT, cidS);
+            selfT.assignedCargo.insert(selfT.assignedCargo.end(), packR.begin(), packR.end());
+
+            // (b) rented 移除 cidR，加入 cidS（丟回 rented：先丟到「第一台有 cidR 的 rented truck」）
+            // 你也可以更聰明：找原本裝 cidR 的那台 rented truck
+            removeCustomerFromRented(ind, cidR);
+            if (ind.rentedTrucks.empty()) {
+                // 沒有 rented truck 就代表 cidR 被移掉了，但我們還要把 cidS 丟去哪？=> rollback
+                ind = std::move(backup);
+                continue;
+            }
+            ind.rentedTrucks[0].assignedCargo.insert(ind.rentedTrucks[0].assignedCargo.end(), packS.begin(), packS.end());
+
+            // (c) repack 兩台車（self + rented[0]）
+            bool ok1 = repackTruck(ind.selfOwnedTrucks[area], cargoLookup, 80);
+            bool ok2 = repackTruck(ind.rentedTrucks[0], cargoLookup, 100);
+
+            if (ok1 && ok2) {
+                // 成功一次 exchange
+                return true;
+            } else {
+                ind = std::move(backup);
+            }
+        }
+    }
+    return false;
+}
+
+// ===== LS-A + LS-B：降低租用車入口 =====
+static int rentedTruckCount(const Individual& ind) {
+    return (int)ind.rentedTrucks.size();
+}
+
+static void localSearchReduceRentedBudget(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    int budgetMoves = 90   // 老師說的總次數（例如 90）
+){
+    static std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> pickOp(0, 2); // 0..2 => 1/3 each
+
+    // 你可以用「租用車數」當主要改善判斷（老師要看 Obj1）
+    int bestRentedCnt = rentedTruckCount(ind);
+
+    for (int iter = 0; iter < budgetMoves; ++iter) {
+        int op = pickOp(rng);
+
+        // 備份：失敗就 rollback
+        Individual backup = ind;
+
+        bool moved = false;
+
+        if (op == opReinsertion) {
+            // 你原本 LS-A 的內容：tryMoveRentedCustomerToSelfTruck(...)
+            moved = doReinsertionOnce(ind, parameters, cargoLookup);   // 你等下照我第3段做
+        } 
+        else if (op == opConsolidation) {
+            // 你原本 LS-B：merge rented trucks
+            moved = doConsolidationOnce(ind, cargoLookup);            // 你等下照我第3段做
+        } 
+        else if (op == opExchange) {
+            // 新增：交換 rented 客戶 與 self 客戶
+            moved = doExchangeOnce(ind, parameters, cargoLookup);     // 你等下照我第4段做
+        }
+
+        // 接受準則：租用車數下降才算改善（最直觀、也符合老師主軸）
+        int nowCnt = rentedTruckCount(ind);
+        if (moved && nowCnt <= bestRentedCnt) {
+            bestRentedCnt = nowCnt;
+        } else {
+            ind = std::move(backup); // rollback
+        }
+
+        // 已經 0 台租用車就提前停
+        if (bestRentedCnt == 0) break;
+    }
+}
 struct SeedCustomer { int area; int omega; };
 
 struct SeedCargo {
