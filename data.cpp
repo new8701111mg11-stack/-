@@ -181,6 +181,8 @@ void printChromosomeInfo(const Individual& indiv){
     cout << endl;
 }
 
+int encodeUndecodedRotationToMatch(const Cargo& cargo, int desiredDecodedRot);
+
 void BLPlacement3D::setCargoLookup(const unordered_map<int, unordered_map<int, Cargo>>& lookup) {
     cargoLookup = lookup;
 }
@@ -218,12 +220,17 @@ bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
 
             // 2) 逐一試 rotation，能放就停
             for (int k = 0; k < 6; ++k) {
-                g.undecodedRotation = rotList[k];
-                g.decodedRotation = rotList[k];
+                 int chosenRot = rotList[k];
+
+                // 先用 chosenRot 做幾何放置測試
+                g.decodedRotation = chosenRot;
                 Box b = getBoxFromGene(g);
                 if (placeBox(b, tempPlaced)) {
                     placed = true;
                     placedBox = b;
+                    const Cargo& c = cargoLookup[g.customerId][g.cargoId];
+                    g.decodedRotation = chosenRot;
+                    g.undecodedRotation = encodeUndecodedRotationToMatch(c, chosenRot);
                     break; // ✅ 放下就停（你要的）
                 }
             }

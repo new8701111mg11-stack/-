@@ -246,6 +246,7 @@ int main(){
         // LS 動完要重算 fitness（避免成本不同步）
                 population[i].fitness.clear();
                 evaluateFitness(population[i], parameters);
+                
             }
         }
 

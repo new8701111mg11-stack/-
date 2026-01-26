@@ -307,6 +307,22 @@ static inline void stripBOM(std::string& s) {
     }
 }
 
+static int encodeUndecodedRotationToMatch(const Cargo& cargo, int desiredDecodedRot) {
+    vector<int> feasible;
+    for (int ori = 0; ori < 6; ++ori)
+        if (cargo.orientation[ori] == 1) feasible.push_back(ori + 1);
+
+    int k = (int)feasible.size();
+    if (k == 0) return 0;
+
+    int pos = -1;
+    for (int i = 0; i < k; ++i) if (feasible[i] == desiredDecodedRot) { pos = i; break; }
+    if (pos < 0) return 0;
+
+    // 最簡單：直接用 pos，讓 pos % k == pos
+    return pos;
+}
+
 std::unordered_map<int, SeedCustomer>
 readSeedCustomerCSV(const std::string& path) {
     std::ifstream fin(path);
@@ -445,62 +461,64 @@ vector<Individual> initializePopulation(const int population_size, const Data& p
 // 進行服務區域的解碼
 void decodeServiceArea(Individual &indiv, const Data &parameters) {
     for (auto &gene : indiv.chromosome) {
-        int customerIdx = gene.customerId - 1; //這是為了對應parameters內的矩陣格式
+        int customerIdx = gene.customerId - 1;
 
         vector<int> feasible_regions;
-        // 取得客戶的可行服務區域
         for (int area = 0; area < regionNum; area++) {
             if (parameters.serviceRegion[customerIdx][area] == 1) {
-                feasible_regions.push_back(area + 1); // 轉換為 {1, 2, 3}
+                feasible_regions.push_back(area + 1);
             }
         }
-
-        // 排序確保由小到大
         sort(feasible_regions.begin(), feasible_regions.end());
 
-        if (gene.undecodedServiceArea == 1) {
-            // 可行區域必定只有一個，直接使用
-            gene.decodedServiceArea = feasible_regions[0];
-        } else {
-            int idx = gene.undecodedServiceArea - 1; // 編碼值從1開始
-            if (idx < feasible_regions.size()) {
-                gene.decodedServiceArea = feasible_regions[idx];
-            } else {
-                cerr << "customer " << gene.customerId << " area wrong" << endl;
-            }
-        }    
-    }
-    // 解碼完區域後，可以知道客戶真正的服務區域，接下來對各區域不屬於該路線的客戶進行刪除，留下只屬於該區域的
-    indiv.chromosome.erase(
-        remove_if(
-            indiv.chromosome.begin(),
-            indiv.chromosome.end(),
-            [](const Gene& g) {
-                return g.routeArea != g.decodedServiceArea;
-            }),
-        indiv.chromosome.end()
-    );
-}
-
-void decodeCargoRotation(Individual &indiv, const Data &parameters,const unordered_map<int, unordered_map<int, Cargo>> &cargoLookup) {
-    for (auto &gene : indiv.chromosome) {
-        // 正確透過 customerId 和 cargoId 找到貨物資訊
-        const Cargo &cargo = cargoLookup.at(gene.customerId).at(gene.cargoId);
-        vector<int> feasibleOrientations;
-        for (int ori = 0; ori < 6; ori++) {
-            if (cargo.orientation[ori] == 1) {
-                feasibleOrientations.push_back(ori + 1);  // 方向1~6
-            }
-        }
-
-        int orientationCount = feasibleOrientations.size();
-        if (orientationCount == 0) {
-            cerr << "error " << gene.customerId << "cargo " << gene.cargoId 
-            << " no feasible orientation" << endl;
+        // 防呆：沒可行區就跳過（或你要直接報錯）
+        if (feasible_regions.empty()) {
+            cerr << "customer " << gene.customerId << " has no feasible region\n";
+            gene.decodedServiceArea = 0;
             continue;
         }
-        // 依照你原本的解碼規則
-        int decodedIndex = (gene.undecodedRotation  % orientationCount);
+
+        if (gene.undecodedServiceArea <= 1) {
+            gene.decodedServiceArea = feasible_regions[0];
+        } else {
+            int idx = gene.undecodedServiceArea - 1;
+            if (idx < (int)feasible_regions.size()) {
+                gene.decodedServiceArea = feasible_regions[idx];
+            } else {
+                // 超界就折回（避免直接 error 讓流程停）
+                gene.decodedServiceArea = feasible_regions[idx % feasible_regions.size()];
+            }
+        }
+    }
+}
+
+void decodeCargoRotation(Individual &indiv,
+                         const Data &parameters,
+                         const unordered_map<int, unordered_map<int, Cargo>> &cargoLookup) {
+    for (auto &gene : indiv.chromosome) {
+        const Cargo &cargo = cargoLookup.at(gene.customerId).at(gene.cargoId);
+
+        vector<int> feasibleOrientations;
+        feasibleOrientations.reserve(6);
+        for (int ori = 0; ori < 6; ori++) {
+            if (cargo.orientation[ori] == 1) {
+                feasibleOrientations.push_back(ori + 1);
+            }
+        }
+
+        int k = (int)feasibleOrientations.size();
+        if (k == 0) {
+            cerr << "error " << gene.customerId << " cargo " << gene.cargoId
+                 << " no feasible orientation\n";
+            gene.decodedRotation = 0;
+            continue;
+        }
+
+        // 讓 undecodedRotation 永遠 >= 0
+        int u = gene.undecodedRotation;
+        if (u < 0) u = -u;
+
+        int decodedIndex = u % k;
         gene.decodedRotation = feasibleOrientations[decodedIndex];
     }
 }
@@ -623,10 +641,14 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
     }
 
     // 先把染色體中出現過的所有客戶初始化為 false（預設都沒裝到）
-    for (const auto &gene : indiv.chromosome) {
-        isLoadedGlobal[gene.customerId] = false;
-        regionMap[gene.decodedServiceArea].push_back(gene);  // 順便建 regionMap
-    }
+   for (const auto &gene : indiv.chromosome) {
+    isLoadedGlobal[gene.customerId] = false;
+
+    // ✅ 過濾放這裡：只是不拿去裝載，不要刪 chromosome
+    if (gene.routeArea != gene.decodedServiceArea) continue;
+
+    regionMap[gene.decodedServiceArea].push_back(gene);
+}
 
     for (int area = 1; area <= regionNum; ++area) {
         if (regionMap.find(area) == regionMap.end()) continue;
