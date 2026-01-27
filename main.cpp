@@ -101,43 +101,9 @@ static int checkTruckBoxes(const vector<Box>& boxes, int L, int W, int H, int tr
     return viol;
 }
 
-static int checkIndividualPlacement(const Individual& ind,
-                                    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-                                    bool verbose=true) {
-    const int L = 300, W = 170, H = 165;
-    int viol = 0;
 
-    // self-owned trucks: 1..regionNum
-    for (int i = 1; i <= regionNum; ++i) {
-        vector<Box> boxes;
-        const Truck& t = ind.selfOwnedTrucks[i];
-        boxes.reserve(t.assignedCargo.size());
-        for (const auto& g : t.assignedCargo) {
-            boxes.push_back(geneToBox(g, cargoLookup));
-        }
-        viol += checkTruckBoxes(boxes, L, W, H, /*truckTag=*/i, verbose);
-    }
-
-    // rented trucks: 0..size-1 (tag 用 1000+idx 避免跟自有車混淆)
-    for (int k = 0; k < (int)ind.rentedTrucks.size(); ++k) {
-        vector<Box> boxes;
-        const Truck& t = ind.rentedTrucks[k];
-        boxes.reserve(t.assignedCargo.size());
-        for (const auto& g : t.assignedCargo) {
-            boxes.push_back(geneToBox(g, cargoLookup));
-        }
-        viol += checkTruckBoxes(boxes, L, W, H, /*truckTag=*/1000 + k, verbose);
-    }
-
-    return viol;
-}
 // GA 比較（你原本那個，保留）
-static bool isBetter(const Individual& a, const Individual& b) {
-    const auto& fa = a.fitness;
-    const auto& fb = b.fitness;
-    if (fa[1] != fb[1]) return fa[1] < fb[1];
-    return fa[0] < fb[0];
-}
+
 /*
 // seed 分區 area(1..regionNum) -> undecodedServiceArea code（讓 decode 後等於 targetArea）
 static int serviceAreaToUndecodedCode(const Data& p, int customerId, int targetArea) {
@@ -178,6 +144,109 @@ static int rotationToUndecodedRotation(const Cargo& c, int desiredDecodedRot) {
 }
 */
 
+static bool isBetter(const Individual& a, const Individual& b) {
+    const auto& fa = a.fitness;
+    const auto& fb = b.fitness;
+    if (fa[1] != fb[1]) return fa[1] < fb[1];
+    return fa[0] < fb[0];
+}
+
+static int checkIndividualPlacement(const Individual& ind,
+                                    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+                                    bool verbose=true) {
+    const int L = 300, W = 170, H = 165;
+    int viol = 0;
+
+    // self-owned trucks: 1..regionNum
+    for (int i = 1; i <= regionNum; ++i) {
+        vector<Box> boxes;
+        const Truck& t = ind.selfOwnedTrucks[i];
+        boxes.reserve(t.assignedCargo.size());
+        for (const auto& g : t.assignedCargo) {
+            boxes.push_back(geneToBox(g, cargoLookup));
+        }
+        viol += checkTruckBoxes(boxes, L, W, H, /*truckTag=*/i, verbose);
+    }
+
+    // rented trucks: 0..size-1 (tag 用 1000+idx 避免跟自有車混淆)
+    for (int k = 0; k < (int)ind.rentedTrucks.size(); ++k) {
+        vector<Box> boxes;
+        const Truck& t = ind.rentedTrucks[k];
+        boxes.reserve(t.assignedCargo.size());
+        for (const auto& g : t.assignedCargo) {
+            boxes.push_back(geneToBox(g, cargoLookup));
+        }
+        viol += checkTruckBoxes(boxes, L, W, H, /*truckTag=*/1000 + k, verbose);
+    }
+
+    return viol;
+}
+
+static bool intensifyBOH(Individual& boh,
+                         const Data& parameters,
+                         const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+                         int iters = 200,
+                         int opsPerIter = 25)   // 建議 20~30
+{
+    bool anyImproved = false;
+
+    // 先確保 fitness 是最新
+    boh.fitness.clear();
+    evaluateFitness(boh, parameters);
+
+    for (int t = 0; t < iters; ++t) {
+        Individual cand = boh;
+
+        // 只針對有租用車的才做（省時間）
+        if (!cand.rentedTrucks.empty()) {
+            localSearchReduceRentedBudget(cand, parameters, cargoLookup, /*maxOps=*/opsPerIter);
+        }
+
+        cand.fitness.clear();
+        evaluateFitness(cand, parameters);
+
+        if (isBetter(cand, boh)) {
+            boh = std::move(cand);
+            anyImproved = true;
+        } else {
+            // ★ 沒改善就停（這個很關鍵，會大幅省時間）
+            break;
+        }
+    }
+    return anyImproved;
+}
+
+void intensifyBOH(Individual& boh,
+                  const Data& parameters,
+                  const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+                  int iters = 200)
+{
+    std::mt19937 rng(std::random_device{}());
+
+    for (int it = 0; it < iters; ++it) {
+        Individual cand = boh;
+
+        // 1) 隨機選一個 LS operation（例如你老師說 1/3 機率）
+        int op = rng() % 3;
+        if (op == 0) doExchangeOnce(cand, parameters, cargoLookup);          // 你說的 exchange
+        if (op == 1) doReinsertionOnce(cand, parameters, cargoLookup);  // rented -> self
+        if (op == 2) doConsolidationOnce(cand, cargoLookup);                   // 合併租用車
+
+        // 2) 重算 fitness（重要）
+        cand.fitness.clear();
+        evaluateFitness(cand, parameters);
+
+        // 3) 只有真的更好才做 3D 檢查（省時間）
+        if (isBetter(cand, boh)) {
+            int viol = checkIndividualPlacement(cand, cargoLookup, false);
+            if (viol == 0) {
+                boh = std::move(cand); // ✅ 更新 BOH
+            }
+        }
+    }
+}
+
+
 static double computeObj1_GurobiStyle(const Individual& ind, const Data& parameters, double C0) {
     std::unordered_set<int> omegaSet; // 出現在 rentedTrucks 的客戶視為 omega=1
     for (const auto& t : ind.rentedTrucks) {
@@ -193,6 +262,7 @@ static double computeObj1_GurobiStyle(const Individual& ind, const Data& paramet
     return obj1;
 }
 
+
 int main(){
     using Clock = std::chrono::high_resolution_clock;
     auto t_start = Clock::now();
@@ -200,6 +270,8 @@ int main(){
     int noImproveCount = 0;
     const int patience = 500;
     double C0 = 6;
+    static Individual BOH;
+    static bool hasBOH = false;
     // 讀檔
     string folder = "datasets/N11_A4_SS20250102";
     Data parameters;
@@ -267,24 +339,38 @@ int main(){
 
         // 更新「全程最佳解」
         bool improvedThisGen = false;
-        if (!hasGlobalBest || isBetter(genBest, globalBest)) {
-            globalBest = genBest;
-            hasGlobalBest = true;
-            noImproveCount = 0;
-            improvedThisGen = true;
-            double curObj1 = computeObj1_GurobiStyle(globalBest, parameters, C0);
+       // 更新「全程最佳解」
+if (!hasGlobalBest || isBetter(genBest, globalBest)) {
+    globalBest = genBest;
+    hasGlobalBest = true;
+    noImproveCount = 0;
 
-// 每一代都記 best-so-far（畫折線用）
-            if (curObj1 < bestObj1SoFar) bestObj1SoFar = curObj1;
-                obj1_best_so_far_series.push_back({generation, bestObj1SoFar});
+    // 先記錄 obj1
+    double curObj1 = computeObj1_GurobiStyle(globalBest, parameters, C0);
+    if (curObj1 < bestObj1SoFar) bestObj1SoFar = curObj1;
+    obj1_best_so_far_series.push_back({generation, bestObj1SoFar});
+    obj1_improve_points.push_back({generation, curObj1});
 
-// 只有發生改善時才記「改善點」
-            if (improvedThisGen) {
-                obj1_improve_points.push_back({generation, curObj1});
-            }
-        } else {
-            ++noImproveCount;
-        }
+    // ★ BOH improved -> intensification（只在 globalBest 更新時做）
+    auto cargoLookup = createCargoLookup(parameters);
+
+    bool improvedByIntensify = intensifyBOH(
+        globalBest, parameters, cargoLookup,
+        /*iters=*/200,
+        /*opsPerIter=*/25
+    );
+
+    if (improvedByIntensify) {
+        // intensification 後 obj1 可能更好，再更新紀錄（可選）
+        double curObj1_2 = computeObj1_GurobiStyle(globalBest, parameters, C0);
+        if (curObj1_2 < bestObj1SoFar) bestObj1SoFar = curObj1_2;
+        obj1_best_so_far_series.push_back({generation, bestObj1SoFar});
+        obj1_improve_points.push_back({generation, curObj1_2});
+    }
+
+    } else {
+    ++noImproveCount;
+    }
 
         cout << "Generation " << generation
         << " global best fitness so far -> "

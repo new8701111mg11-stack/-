@@ -14,6 +14,8 @@
 
 using namespace std;
 
+
+
 enum ReduceOp {
     opReinsertion = 0,   // rented -> self
     opConsolidation = 1, // merge rented trucks
@@ -802,6 +804,11 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
     indiv.rentedTrucks = rentedTrucks;
     indiv.fitness.push_back(rentedVehicleCargoCost);
 }
+
+
+
+
+
 
 vector<Individual> selection(const vector<Individual>& population, const vector<Individual>& decodedPopulation, double eliteRatio = 0.05, int tournamentSize = 2) {
     
