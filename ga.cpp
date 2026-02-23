@@ -7,14 +7,16 @@
 #include <algorithm>
 #include <numeric>
 #include <iostream>
+#include <unordered_set>
 #include <unordered_map>
 #include <chrono>
 #include <utility>
 #include <cassert>
+#include <omp.h>
+#include <limits>
+#include <cmath>
 
 using namespace std;
-
-
 
 enum ReduceOp {
     opReinsertion = 0,   // rented -> self
@@ -25,7 +27,7 @@ enum ReduceOp {
 // ===== Helper: 把一台 Truck 內的 assignedCargo 全部重排（repack） =====
 static bool repackTruck(Truck& t,
                         const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-                        int maxTriesInsert = 80)
+                        int maxTriesInsert = 500)
 {
     BLPlacement3D loader(t.length, t.width, t.height);
     loader.setCargoLookup(cargoLookup);
@@ -239,7 +241,6 @@ static bool doExchangeOnce(
     return false;
 }
 
-// ===== LS-A + LS-B：降低租用車入口 =====
 static int rentedTruckCount(const Individual& ind) {
     return (int)ind.rentedTrucks.size();
 }
@@ -248,7 +249,7 @@ static void localSearchReduceRentedBudget(
     Individual& ind,
     const Data& parameters,
     const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    int budgetMoves = 90   // 老師說的總次數（例如 90）
+    int budgetMoves = 1800   // 老師說的總次數（例如 90）
 ){
     static std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<int> pickOp(0, 2); // 0..2 => 1/3 each
@@ -281,6 +282,7 @@ static void localSearchReduceRentedBudget(
         int nowCnt = rentedTruckCount(ind);
         if (moved && nowCnt <= bestRentedCnt) {
             bestRentedCnt = nowCnt;
+            break;
         } else {
             ind = std::move(backup); // rollback
         }
@@ -307,22 +309,6 @@ static inline void stripBOM(std::string& s) {
         (unsigned char)s[2] == 0xBF) {
         s.erase(0, 3);
     }
-}
-
-static int encodeUndecodedRotationToMatch(const Cargo& cargo, int desiredDecodedRot) {
-    vector<int> feasible;
-    for (int ori = 0; ori < 6; ++ori)
-        if (cargo.orientation[ori] == 1) feasible.push_back(ori + 1);
-
-    int k = (int)feasible.size();
-    if (k == 0) return 0;
-
-    int pos = -1;
-    for (int i = 0; i < k; ++i) if (feasible[i] == desiredDecodedRot) { pos = i; break; }
-    if (pos < 0) return 0;
-
-    // 最簡單：直接用 pos，讓 pos % k == pos
-    return pos;
 }
 
 std::unordered_map<int, SeedCustomer>
@@ -463,64 +449,62 @@ vector<Individual> initializePopulation(const int population_size, const Data& p
 // 進行服務區域的解碼
 void decodeServiceArea(Individual &indiv, const Data &parameters) {
     for (auto &gene : indiv.chromosome) {
-        int customerIdx = gene.customerId - 1;
+        int customerIdx = gene.customerId - 1; //這是為了對應parameters內的矩陣格式
 
         vector<int> feasible_regions;
+        // 取得客戶的可行服務區域
         for (int area = 0; area < regionNum; area++) {
             if (parameters.serviceRegion[customerIdx][area] == 1) {
-                feasible_regions.push_back(area + 1);
+                feasible_regions.push_back(area + 1); // 轉換為 {1, 2, 3}
             }
         }
+
+        // 排序確保由小到大
         sort(feasible_regions.begin(), feasible_regions.end());
 
-        // 防呆：沒可行區就跳過（或你要直接報錯）
-        if (feasible_regions.empty()) {
-            cerr << "customer " << gene.customerId << " has no feasible region\n";
-            gene.decodedServiceArea = 0;
-            continue;
-        }
-
-        if (gene.undecodedServiceArea <= 1) {
+        if (gene.undecodedServiceArea == 1) {
+            // 可行區域必定只有一個，直接使用
             gene.decodedServiceArea = feasible_regions[0];
         } else {
-            int idx = gene.undecodedServiceArea - 1;
-            if (idx < (int)feasible_regions.size()) {
+            int idx = gene.undecodedServiceArea - 1; // 編碼值從1開始
+            if (idx < feasible_regions.size()) {
                 gene.decodedServiceArea = feasible_regions[idx];
             } else {
-                // 超界就折回（避免直接 error 讓流程停）
-                gene.decodedServiceArea = feasible_regions[idx % feasible_regions.size()];
+                cerr << "customer " << gene.customerId << " area wrong" << endl;
             }
-        }
+        }    
     }
+    // 解碼完區域後，可以知道客戶真正的服務區域，接下來對各區域不屬於該路線的客戶進行刪除，留下只屬於該區域的
+    indiv.chromosome.erase(
+        remove_if(
+            indiv.chromosome.begin(),
+            indiv.chromosome.end(),
+            [](const Gene& g) {
+                return g.routeArea != g.decodedServiceArea;
+            }),
+        indiv.chromosome.end()
+    );
 }
 
-void decodeCargoRotation(Individual &indiv,
-                         const Data &parameters,
-                         const unordered_map<int, unordered_map<int, Cargo>> &cargoLookup) {
+void decodeCargoRotation(Individual &indiv, const Data &parameters,const unordered_map<int, unordered_map<int, Cargo>> &cargoLookup) {
     for (auto &gene : indiv.chromosome) {
+        // 正確透過 customerId 和 cargoId 找到貨物資訊
         const Cargo &cargo = cargoLookup.at(gene.customerId).at(gene.cargoId);
-
         vector<int> feasibleOrientations;
-        feasibleOrientations.reserve(6);
         for (int ori = 0; ori < 6; ori++) {
             if (cargo.orientation[ori] == 1) {
-                feasibleOrientations.push_back(ori + 1);
+                feasibleOrientations.push_back(ori + 1);  // 方向1~6
             }
         }
 
-        int k = (int)feasibleOrientations.size();
-        if (k == 0) {
-            cerr << "error " << gene.customerId << " cargo " << gene.cargoId
-                 << " no feasible orientation\n";
-            gene.decodedRotation = 0;
+        int orientationCount = feasibleOrientations.size();
+        if (orientationCount == 0) {
+            cerr << "error " << gene.customerId << "cargo " << gene.cargoId 
+            << " no feasible orientation" << endl;
             continue;
         }
-
-        // 讓 undecodedRotation 永遠 >= 0
-        int u = gene.undecodedRotation;
-        if (u < 0) u = -u;
-
-        int decodedIndex = u % k;
+        // 依照你原本的解碼規則
+        int decodedIndex = (gene.undecodedRotation  % orientationCount);
         gene.decodedRotation = feasibleOrientations[decodedIndex];
     }
 }
@@ -535,7 +519,8 @@ unordered_map<int, unordered_map<int, Cargo>> createCargoLookup(const Data &para
 }
 
 void decodePopulation(vector<Individual>& decodedPopulation, const Data &parameters, const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup){
-   for (int i = 0; i < decodedPopulation.size(); ++i) {
+#pragma omp parallel for
+    for (int i = 0; i < decodedPopulation.size(); ++i) {
         decodeServiceArea(decodedPopulation[i], parameters);
         decodeCargoRotation(decodedPopulation[i], parameters, cargoLookup);
     }
@@ -628,9 +613,9 @@ static bool localSearchRotateAllAndTryInsert(
 }
 
 void evaluateFitness(Individual &indiv, const Data &parameters) {
-
-    long long rentedVehicleCargoCost = 0;
+    indiv.fitness.clear();
     long long vechicleLoadedMaxGap = 0;
+    long long rentedVehicleCargoCost = 0;
 
     Truck selfOwnedTrucks[regionNum + 1]; // 每一區域皆有自己的自有車輛
     vector<Truck> rentedTrucks;
@@ -643,14 +628,10 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
     }
 
     // 先把染色體中出現過的所有客戶初始化為 false（預設都沒裝到）
-   for (const auto &gene : indiv.chromosome) {
-    isLoadedGlobal[gene.customerId] = false;
-
-    // ✅ 過濾放這裡：只是不拿去裝載，不要刪 chromosome
-    if (gene.routeArea != gene.decodedServiceArea) continue;
-
-    regionMap[gene.decodedServiceArea].push_back(gene);
-}
+    for (const auto &gene : indiv.chromosome) {
+        isLoadedGlobal[gene.customerId] = false;
+        regionMap[gene.decodedServiceArea].push_back(gene);  // 順便建 regionMap
+    }
 
     for (int area = 1; area <= regionNum; ++area) {
         if (regionMap.find(area) == regionMap.end()) continue;
@@ -691,7 +672,7 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
                 }
             } else {
                 // 這個顧客裝不下 → 保持 false，後面交給租用車
-                break;
+                continue;
             }
         }
     }
@@ -761,10 +742,10 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
             );
 
     // 你可以順便印 overflow 讓你知道是不是「體積真的爆了」
-    if (!canLoad) {
+    /*if (!canLoad) {
         cerr << "[LS FAIL] cust " << custId
              << " bestOverflowVolume=" << bestOverflow << "\n";
-    }
+    }*/
 }
             if (canLoad) {
                 anyLoadedThisTruck = true;
@@ -776,7 +757,7 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
 
                 for (const auto& g : cargoGroup) {
                     const Cargo& c = loader.cargoLookup[g.customerId][g.cargoId];
-                    long long chargeUnits = c.volume / 27000;
+                    int chargeUnits = c.volume;
                     rentedVehicleCargoCost += chargeUnits * 6;
                 }
             } else {
@@ -803,10 +784,9 @@ void evaluateFitness(Individual &indiv, const Data &parameters) {
     }
     indiv.rentedTrucks = rentedTrucks;
     indiv.fitness.push_back(rentedVehicleCargoCost);
+    indiv.rentedVehicleLoadingCost = (double)rentedVehicleCargoCost;
+
 }
-
-
-
 
 
 
@@ -1011,6 +991,591 @@ void mutateRotation(Individual& indiv, double mutationRate) {
                 newRotation = rand() % 6 + 1;  // 避免跟原本一樣
             }
             gene.undecodedRotation = newRotation;
+        }
+    }
+}
+// ===================== 你已有/你之前用過的 helper（若已存在可略過） =====================
+
+static bool evalCandidate_NoWorseObj1(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    long long baselineF1
+){
+    vector<Individual> tmp{ ind };
+    decodePopulation(tmp, parameters, cargoLookup);
+    ind = tmp[0];
+
+    ind.fitness.clear();
+    evaluateFitness(ind, parameters);
+
+    if (ind.fitness.size() < 2) return false;
+
+    // Obj1 不變差（允許變更好）
+    if (ind.fitness[1] > baselineF1) return false;
+
+    return true;
+}
+
+
+static inline bool canServe(const Data& parameters, int customerId, int area) {
+    return parameters.serviceRegion[customerId - 1][area - 1] == 1;
+}
+
+static unordered_set<int> collectOmegaRentedCustomers(const Individual& ind) {
+    unordered_set<int> omega;
+    for (const auto& rt : ind.rentedTrucks)
+        for (const auto& g : rt.assignedCargo)
+            omega.insert(g.customerId);
+    return omega;
+}
+
+// 每客戶一次，排除Ω
+static void buildCustomerAreaMap_SelfOnly(
+    const Individual& ind,
+    const unordered_set<int>& omega,
+    unordered_map<int,int>& custArea,
+    vector<vector<int>>& customersInArea
+){
+    custArea.clear();
+    customersInArea.assign(regionNum + 1, {});
+    for (const auto& g : ind.chromosome) {
+        int cid = g.customerId;
+        if (omega.count(cid)) continue;
+        if (custArea.find(cid) != custArea.end()) continue;
+        int a = g.routeArea;
+        if (a < 1 || a > regionNum) continue;
+        custArea[cid] = a;
+        customersInArea[a].push_back(cid);
+    }
+}
+
+static void applyMoveCustomerArea(Individual& ind, int cid, int newArea) {
+    for (auto& g : ind.chromosome)
+        if (g.customerId == cid)
+            g.routeArea = newArea;
+}
+
+static void applySwapCustomersArea(Individual& ind, int cidA, int areaA, int cidB, int areaB) {
+    for (auto& g : ind.chromosome) {
+        if (g.customerId == cidA) g.routeArea = areaB;
+        else if (g.customerId == cidB) g.routeArea = areaA;
+    }
+}
+
+// ===================== Teacher-style Obj2 比較（字典序） =====================
+struct Obj2State {
+    long long maxLoad;
+    long long minLoad;
+    long long gap() const { return maxLoad - minLoad; }
+};
+
+static Obj2State getObj2State(const Individual& ind) {
+    long long mx = 0;
+    long long mn = LLONG_MAX;
+    for (int a = 1; a <= regionNum; ++a) {
+        mx = max(mx, ind.selfOwnedTrucks[a].loadedVolume);
+        mn = min(mn, ind.selfOwnedTrucks[a].loadedVolume);
+    }
+    return {mx, mn};
+}
+
+static bool betterObj2Lex(const Obj2State& cur, const Obj2State& base) {
+    if (cur.maxLoad != base.maxLoad) return cur.maxLoad < base.maxLoad;
+    if (cur.minLoad != base.minLoad) return cur.minLoad > base.minLoad;
+    return cur.gap() < base.gap();
+}
+
+
+static bool equalObj2(const Obj2State& a, const Obj2State& b) {
+    return a.maxLoad == b.maxLoad && a.minLoad == b.minLoad && a.gap() == b.gap();
+}
+
+// cur 不比 base 差（允許平手 / 或在 lex 序上不後退）
+static bool notWorseObj2Lex(const Obj2State& cur, const Obj2State& base) {
+    // 只要 base 不比 cur 好，就代表 cur >= base（lex）
+    return !betterObj2Lex(base, cur);
+}
+// maxLoad 越小越好；同 maxLoad 時 minLoad 越大越好；再同看 gap
+
+
+
+
+// ===================== OSR 候選：serviceRegion 交集 + 相鄰區域 =====================
+// 從 areaFrom 移到 areaTo 的 OSR 客戶：目前在 areaFrom，且同時可由 areaTo 服務（也可由 areaFrom 服務通常成立）
+static vector<int> getOSRCustomers_FromTo(
+    const vector<vector<int>>& customersInArea,
+    const Data& parameters,
+    const unordered_set<int>& omega,
+    int areaFrom, int areaTo
+){
+    vector<int> res;
+    for (int cid : customersInArea[areaFrom]) {
+        if (omega.count(cid)) continue;
+        if (canServe(parameters, cid, areaFrom) && canServe(parameters, cid, areaTo)) {
+            res.push_back(cid);
+        }
+    }
+    return res;
+}
+
+// 用 totalVolume 當作啟發式排序（大件優先）
+static void sortByVolumeDesc(vector<int>& cands, const Data& parameters) {
+    sort(cands.begin(), cands.end(), [&](int x, int y){
+        return parameters.totalVolume[x - 1] > parameters.totalVolume[y - 1];
+    });
+}
+
+// ===================== 核心：對指定 area 嘗試 Reduce-Max（先 insertion 再 exchange） =====================
+static bool decodeEvalKeepObj1Baseline_BestOfN(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    long long obj1Baseline,
+    int N
+){
+    Individual best = ind;
+    bool hasBest = false;
+
+    long long bestF1 = LLONG_MAX;
+    Obj2State bestObj2{LLONG_MAX, 0};
+
+    for (int t = 0; t < N; ++t) {
+        Individual cand = ind;
+
+        vector<Individual> tmp{ cand };
+        decodePopulation(tmp, parameters, cargoLookup);
+        cand = tmp[0];
+
+        cand.fitness.clear();
+        evaluateFitness(cand, parameters);
+
+        if (cand.fitness.size() < 2) continue;
+        if (cand.fitness[1] > obj1Baseline) continue;  // Obj1 不變差
+
+        Obj2State st = getObj2State(cand);
+
+        // 先比 Obj1，再比 Obj2Lex（你也可以只挑 Obj2 最好）
+        if (!hasBest ||
+            cand.fitness[1] < bestF1 ||
+            (cand.fitness[1] == bestF1 && betterObj2Lex(st, bestObj2)))
+        {
+            hasBest = true;
+            best = cand;
+            bestF1 = cand.fitness[1];
+            bestObj2 = st;
+        }
+    }
+
+    if (!hasBest) return false;
+
+    ind = best;
+    return true;
+}
+
+
+static bool tryReduceMaxOnArea_KeepObj1Baseline(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    long long obj1Baseline,
+    int areaA,
+    int repackRestarts
+){
+    Obj2State base = getObj2State(ind);
+
+    vector<int> neighbors;
+    if (areaA - 1 >= 1) neighbors.push_back(areaA - 1);
+    if (areaA + 1 <= regionNum) neighbors.push_back(areaA + 1);
+
+    // 這裡 omegaBaseline 已移除：改成 self-only map（你原本的 build 需要 omega，我用空集合表示「沒有人禁止動」，
+    // 但真正禁止動的是「不能讓 Obj1 變大」，由 obj1Baseline 保護。
+    unordered_set<int> omegaEmpty;
+    unordered_map<int,int> custArea;
+    vector<vector<int>> customersInArea;
+    buildCustomerAreaMap_SelfOnly(ind, omegaEmpty, custArea, customersInArea);
+
+    // A1) Insertion
+    for (int areaB : neighbors) {
+        auto Sa = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
+        if (Sa.empty()) continue;
+        sortByVolumeDesc(Sa, parameters);
+
+        for (int cid : Sa) {
+            Individual backup = ind;
+
+            for (int r = 0; r < repackRestarts; ++r) {
+                ind = backup;
+                applyMoveCustomerArea(ind, cid, areaB);
+
+                if (!decodeEvalKeepObj1Baseline_BestOfN(ind, parameters, cargoLookup, obj1Baseline, /*N=*/10)
+) {
+                    continue;
+                }
+
+                Obj2State cur = getObj2State(ind);
+                if (betterObj2Lex(cur, base)) return true;
+            }
+            ind = backup;
+        }
+    }
+
+    // A2) Pair-exchange
+    for (int areaB : neighbors) {
+        auto Sa = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
+        auto Sb = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
+        if (Sa.empty() || Sb.empty()) continue;
+
+        struct Cand { int i, j; long long improveA; };
+        vector<Cand> cands;
+        long long loadA = ind.selfOwnedTrucks[areaA].loadedVolume;
+
+        for (int i : Sa) {
+            long long vi = parameters.totalVolume[i - 1];
+            for (int j : Sb) {
+                long long vj = parameters.totalVolume[j - 1];
+                long long newA = loadA - vi + vj;
+                long long improve = loadA - newA;
+                if (improve > 0) cands.push_back({i, j, improve});
+            }
+        }
+        if (cands.empty()) continue;
+
+        sort(cands.begin(), cands.end(), [&](const Cand& x, const Cand& y){
+            return x.improveA > y.improveA;
+        });
+
+        for (const auto& pc : cands) {
+            Individual backup = ind;
+
+            for (int r = 0; r < repackRestarts; ++r) {
+                ind = backup;
+                applySwapCustomersArea(ind, pc.i, areaA, pc.j, areaB);
+
+                if (!decodeEvalKeepObj1Baseline_BestOfN(ind, parameters, cargoLookup, obj1Baseline, /*N=*/10)
+) {
+                    continue;
+                }
+
+                Obj2State cur = getObj2State(ind);
+                if (betterObj2Lex(cur, base)) return true;
+            }
+            ind = backup;
+        }
+    }
+
+    return false;
+}
+
+static bool tryIncreaseMinOnArea_KeepObj1Baseline(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    long long obj1Baseline,
+    int areaA,
+    int repackRestarts
+){
+    Obj2State base = getObj2State(ind);
+
+    vector<int> neighbors;
+    if (areaA - 1 >= 1) neighbors.push_back(areaA - 1);
+    if (areaA + 1 <= regionNum) neighbors.push_back(areaA + 1);
+
+    unordered_set<int> omegaEmpty;
+    unordered_map<int,int> custArea;
+    vector<vector<int>> customersInArea;
+    buildCustomerAreaMap_SelfOnly(ind, omegaEmpty, custArea, customersInArea);
+
+    // B1) Insertion
+    for (int areaB : neighbors) {
+        auto Sb_to_A = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
+        if (Sb_to_A.empty()) continue;
+        sortByVolumeDesc(Sb_to_A, parameters);
+
+        for (int cid : Sb_to_A) {
+            Individual backup = ind;
+
+            for (int r = 0; r < repackRestarts; ++r) {
+                ind = backup;
+                applyMoveCustomerArea(ind, cid, areaA);
+
+                if (!decodeEvalKeepObj1Baseline_BestOfN(ind, parameters, cargoLookup, obj1Baseline, /*N=*/10)
+) {
+                    continue;
+                }
+
+                Obj2State cur = getObj2State(ind);
+                if (betterObj2Lex(cur, base)) return true;
+            }
+            ind = backup;
+        }
+    }
+
+    // B2) Pair-exchange
+    for (int areaB : neighbors) {
+        auto A_to_B = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
+        auto B_to_A = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
+        if (A_to_B.empty() || B_to_A.empty()) continue;
+
+        struct Cand { int iFromB, jFromA; long long improveMin; };
+        vector<Cand> cands;
+        long long loadA = ind.selfOwnedTrucks[areaA].loadedVolume;
+
+        for (int i : B_to_A) {
+            long long vi = parameters.totalVolume[i - 1];
+            for (int j : A_to_B) {
+                long long vj = parameters.totalVolume[j - 1];
+                long long newA = loadA + vi - vj;
+                long long improve = newA - loadA;
+                if (improve > 0) cands.push_back({i, j, improve});
+            }
+        }
+        if (cands.empty()) continue;
+
+        sort(cands.begin(), cands.end(), [&](const Cand& x, const Cand& y){
+            return x.improveMin > y.improveMin;
+        });
+
+        for (const auto& pc : cands) {
+            Individual backup = ind;
+
+            for (int r = 0; r < repackRestarts; ++r) {
+                ind = backup;
+                applySwapCustomersArea(ind, pc.iFromB, areaB, pc.jFromA, areaA);
+
+                if (!decodeEvalKeepObj1Baseline_BestOfN(ind, parameters, cargoLookup, obj1Baseline, /*N=*/10)
+) {
+                    continue;
+                }
+
+                Obj2State cur = getObj2State(ind);
+                if (betterObj2Lex(cur, base)) return true;
+            }
+            ind = backup;
+        }
+    }
+
+    return false;
+}
+
+static bool tryTwoStepImproveOnArea_Obj2Lex(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    long long baselineF1,
+    int areaA,
+    int repackRestarts,
+    bool isReduceMaxPhase
+){
+    Obj2State base2 = getObj2State(ind);
+
+    // neighbors
+    vector<int> neighbors;
+    if (areaA - 1 >= 1) neighbors.push_back(areaA - 1);
+    if (areaA + 1 <= regionNum) neighbors.push_back(areaA + 1);
+
+    // 用你原本的 OSR 產生法（這裡不排除 omega，靠 Obj1 baseline 擋）
+    unordered_set<int> omegaEmpty;
+    unordered_map<int,int> custArea;
+    vector<vector<int>> customersInArea;
+    buildCustomerAreaMap_SelfOnly(ind, omegaEmpty, custArea, customersInArea);
+
+    struct Move {
+        int type; // 0=move, 1=swap
+        int c1, from1, to1;
+        int c2, from2, to2;
+        long long pri;
+    };
+
+    vector<Move> step1;
+    step1.reserve(2000);
+
+    // --- build step1 moves (move + swap) ---
+    for (int areaB : neighbors) {
+        if (isReduceMaxPhase) {
+            // move: areaA -> areaB
+            auto Sa = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
+            sortByVolumeDesc(Sa, parameters);
+            for (int cid : Sa) {
+                step1.push_back({0, cid, areaA, areaB, -1, -1, -1, parameters.totalVolume[cid - 1]});
+            }
+
+            // swap: areaA <-> areaB (prioritize reducing load of areaA)
+            auto Sb = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
+            long long loadA = ind.selfOwnedTrucks[areaA].loadedVolume;
+            for (int i : Sa) {
+                long long vi = parameters.totalVolume[i - 1];
+                for (int j : Sb) {
+                    long long vj = parameters.totalVolume[j - 1];
+                    long long improveA = vi - vj; // >0 means reduce A
+                    if (improveA > 0) step1.push_back({1, i, areaA, areaB, j, areaB, areaA, improveA});
+                }
+            }
+        } else {
+            // increase min: move areaB -> areaA
+            auto Sb_to_A = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
+            sortByVolumeDesc(Sb_to_A, parameters);
+            for (int cid : Sb_to_A) {
+                step1.push_back({0, cid, areaB, areaA, -1, -1, -1, parameters.totalVolume[cid - 1]});
+            }
+
+            // swap: bring bigger into A
+            auto A_to_B = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
+            long long loadA = ind.selfOwnedTrucks[areaA].loadedVolume;
+            for (int i : Sb_to_A) {
+                long long vi = parameters.totalVolume[i - 1];
+                for (int j : A_to_B) {
+                    long long vj = parameters.totalVolume[j - 1];
+                    long long improve = vi - vj;
+                    if (improve > 0) step1.push_back({1, i, areaB, areaA, j, areaA, areaB, improve});
+                }
+            }
+        }
+    }
+
+    sort(step1.begin(), step1.end(), [](const Move& a, const Move& b){
+        return a.pri > b.pri;
+    });
+
+    // --- try step1 then step2 ---
+    for (const auto& m1 : step1) {
+        Individual s0 = ind;
+
+        for (int r1 = 0; r1 < repackRestarts; ++r1) {
+            ind = s0;
+
+            if (m1.type == 0) applyMoveCustomerArea(ind, m1.c1, m1.to1);
+            else applySwapCustomersArea(ind, m1.c1, m1.from1, m1.c2, m1.from2);
+
+            if (!evalCandidate_NoWorseObj1(ind, parameters, cargoLookup, baselineF1)) continue;
+
+            Obj2State st1 = getObj2State(ind);
+
+            // ✅ step1 允許不變差（plateau）
+            if (!notWorseObj2Lex(st1, base2)) continue;
+
+            Individual after1 = ind;
+
+            // step2: 再做一個 move（這裡先用 insertion 就很有效；你要也可再加 swap）
+            unordered_map<int,int> custArea2;
+            vector<vector<int>> customersInArea2;
+            buildCustomerAreaMap_SelfOnly(after1, omegaEmpty, custArea2, customersInArea2);
+
+            for (int areaB : neighbors) {
+                vector<int> cand2;
+                if (isReduceMaxPhase)
+                    cand2 = getOSRCustomers_FromTo(customersInArea2, parameters, omegaEmpty, areaA, areaB);
+                else
+                    cand2 = getOSRCustomers_FromTo(customersInArea2, parameters, omegaEmpty, areaB, areaA);
+
+                if (cand2.empty()) continue;
+                sortByVolumeDesc(cand2, parameters);
+
+                for (int cid2 : cand2) {
+                    Individual s1 = after1;
+
+                    for (int r2 = 0; r2 < repackRestarts; ++r2) {
+                        ind = s1;
+
+                        if (isReduceMaxPhase) applyMoveCustomerArea(ind, cid2, areaB);
+                        else applyMoveCustomerArea(ind, cid2, areaA);
+
+                        if (!evalCandidate_NoWorseObj1(ind, parameters, cargoLookup, baselineF1)) continue;
+
+                        Obj2State st2 = getObj2State(ind);
+
+                        // ✅ step2 要求嚴格改善（真正進步）
+                        if (betterObj2Lex(st2, base2)) return true;
+                    }
+                }
+            }
+        }
+
+        ind = s0;
+    }
+
+    return false;
+}
+
+void localSearch_Obj2_TeacherStyle(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    int repackRestarts
+){
+    // 入口假設：ind 已經有有效的 fitness & trucks 狀態
+    if (ind.fitness.size() < 2) return;
+    const long long obj1Baseline = ind.fitness[1]; // ✅ Obj1 不變差（或你要完全不變就改 evalCandidate）
+
+    bool improved = true;
+    while (improved) {
+        improved = false;
+
+        // ===================== Phase A: Reduce Max =====================
+        {
+            vector<int> areas(regionNum);
+            iota(areas.begin(), areas.end(), 1);
+            sort(areas.begin(), areas.end(), [&](int x, int y){
+                return ind.selfOwnedTrucks[x].loadedVolume > ind.selfOwnedTrucks[y].loadedVolume;
+            });
+
+            for (int a : areas) {
+                // ✅ 先用兩步 look-ahead（允許 step1 plateau，step2 必須嚴格改善 Obj2Lex）
+                if (tryTwoStepImproveOnArea_Obj2Lex(
+                        ind, parameters, cargoLookup,
+                        obj1Baseline, a, repackRestarts,
+                        /*isReduceMaxPhase=*/true
+                    )) {
+                    ind.fitness.clear();
+                    evaluateFitness(ind, parameters);
+                    improved = true;
+                    break;
+                }
+
+                // （可選）fallback：原本一步 operator（如果你想保留）
+                if (tryReduceMaxOnArea_KeepObj1Baseline(
+                        ind, parameters, cargoLookup,
+                        obj1Baseline, a, repackRestarts
+                    )) {
+                    ind.fitness.clear();
+                    evaluateFitness(ind, parameters);
+                    improved = true;
+                    break;
+                }
+            }
+        }
+
+        // ===================== Phase B: Increase Min =====================
+        {
+            vector<int> areas(regionNum);
+            iota(areas.begin(), areas.end(), 1);
+            sort(areas.begin(), areas.end(), [&](int x, int y){
+                return ind.selfOwnedTrucks[x].loadedVolume < ind.selfOwnedTrucks[y].loadedVolume;
+            });
+
+            for (int a : areas) {
+                if (tryTwoStepImproveOnArea_Obj2Lex(
+                        ind, parameters, cargoLookup,
+                        obj1Baseline, a, repackRestarts,
+                        /*isReduceMaxPhase=*/false
+                    )) {
+                    ind.fitness.clear();
+                    evaluateFitness(ind, parameters);
+                    improved = true;
+                    break;
+                }
+
+                // （可選）fallback：原本一步 operator
+                if (tryIncreaseMinOnArea_KeepObj1Baseline(
+                        ind, parameters, cargoLookup,
+                        obj1Baseline, a, repackRestarts
+                    )) {
+                    ind.fitness.clear();
+                    evaluateFitness(ind, parameters);
+                    improved = true;
+                    break;
+                }
+            }
         }
     }
 }
