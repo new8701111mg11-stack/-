@@ -5,6 +5,7 @@ import numpy as np
 import random
 import ast
 import csv
+import math
 import os
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -71,10 +72,44 @@ def plot_vehicle_stacks(vehicle_stacks, L, W, H):
             ax.add_collection3d(Poly3DCollection(faces, facecolors=color, linewidths=1, edgecolors='k', alpha=0.8))
         
         plt.show()
+import os
+
+def read_solomon_xy(filepath):
+    coords = {}
+
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    # 找 CUSTOMER 表頭
+    start = None
+    for i, line in enumerate(lines):
+        if "CUST NO." in line and "XCOORD" in line:
+            start = i + 1
+            break
+
+    if start is None:
+        raise ValueError("找不到 CUSTOMER 表頭")
+
+    # 只讀前三欄：id, x, y
+    for line in lines[start:]:
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+
+        try:
+            cust_id = int(parts[0])
+            x = float(parts[1])
+            y = float(parts[2])
+        except:
+            continue
+
+        coords[cust_id] = (x, y)
+
+    return coords
 
 model = Model("ChainOsr")
-Z = 4   # 區域數量
-N = 60  # 客戶數量
+Z = 4    # 區域數量
+N = 12  # 客戶數量
 N0 = 49 # 節點數量(包含倉庫和客戶節點)
 O = 6   # 旋轉方向
 L, W, H = 300,170,165  #貨櫃長寬高
@@ -89,19 +124,24 @@ hito = {} #客戶 i 的第 t 件貨物以擺放方向 o 時的高
 pito = {} #擺放方向指標
 fit = {}  #脆弱性貨物指標
 Gi = {}   #客戶 i 的貨物數量
+solomon_path =  r"datasets/C101.txt"
+coords = read_solomon_xy(solomon_path)
 
+
+print(coords[0])   # depot
+print(coords[1])   # customer 1
 Neb = defaultdict(set)  #在非重疊服務區域 b 內的客戶集合
 Nobb1 = defaultdict(list) #在服務區域 b 和 b+1 重疊部分內的客戶集合
 Nb = defaultdict(list)   #在服務區域b的預定義之車輛路線的節點，沒有倉庫
 Ab = defaultdict(list)    #所有已完成路線的弧線集合
-base_dir = r"datasets/N60_A4_S20250102" 
+base_dir = r"datasets/N12_A4_S20250102" 
 
 with open(os.path.join(base_dir, "customerInfo.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         customer_id = int(row['客戶'].strip())
         cargo_count = int(row['貨物數'].strip())
-        totalVolume = int(row['總才積'].strip())
+        totalVolume = float(row['總才積'].strip())
         Gi[customer_id] = cargo_count
         vi[customer_id] = totalVolume
 
@@ -110,7 +150,7 @@ with open(os.path.join(base_dir, "goods.csv"), newline='', encoding='utf-8-sig')
     for row in reader:
         customer_id = int(row['客戶'])
         t = int(row['貨物'])
-        cargoVolume = int(row['材積'])
+        cargoVolume =float(row['材積'])
         good_l = int(row['長'])
         good_w = int(row['寬'])
         good_h = int(row['高'])
@@ -194,6 +234,15 @@ with open(os.path.join(base_dir, "routeArcs.csv"), newline='', encoding='utf-8-s
         Ab[area+1].append((start, end))  
     Ab = OrderedDict(sorted(Ab.items())) 
 # print(Ab)
+
+# g as parameter, indexed by (b,i,j)
+
+g = {}
+for b in Ab:
+    for (i, j) in Ab[b]:
+        xi, yi = coords[i]
+        xj, yj = coords[j]
+        g[b, i, j] = math.hypot(xi - xj, yi - yj)
 
 #定義各區弧線集合
 arc_vars = []
@@ -295,11 +344,23 @@ R = model.addVars(
     name="R"
 ) #第b區自有車輛裝載總才積
 
+# --- New variable: epsilon_b ---
+eps = model.addVars(range(1, Z+1), vtype=GRB.BINARY, name="eps")
+# eps[b] = 1 if area b has any self-owned served customer
+
+# --- New variable: h_b (whether self-owned truck in area b is used) ---
+hb = model.addVars(range(1, Z+1), vtype=GRB.BINARY, name="hb")
+
 R_max = model.addVar(vtype=GRB.CONTINUOUS, name="R_max") #所有自有車輛服務區域之最大裝載總才積
 R_min = model.addVar(vtype=GRB.CONTINUOUS, name="R_min") #所有自有車輛服務區域之最小裝載總才積
 
 #目標式
 obj1 = quicksum(C0 * vi[i] * omega[i] for i in range(1, N+1))   # 第一層目標（較重要）
+obj1 += quicksum(
+    g[b, i, j] * psi[i, j, b]
+    for b in Ab              # 用 Ab 的 key
+    for (i, j) in Ab[b]
+)
 obj2 = R_max - R_min   
 
 model.ModelSense = GRB.MINIMIZE
@@ -335,13 +396,13 @@ for b in Nobb1:  # Nobb1[b] = list of customers in overlap between b and b+1
 #3B
 for b in Neb:
     for i in Neb[b]:
-        model.addConstr(delta[i, b] + omega[i] == 1)
+        model.addConstr(delta[i, b] == 1)
 #3C
 for b in range(2, Z + 1):  # Z2 ~ Zu
     if (b-1) in Nobb1:
         for i in Nobb1[b-1]:
-            model.addConstr(delta[i, b] + omega[i] == zeta[i, b])
-            model.addConstr(delta[i, b-1] + omega[i] == zeta[i, b-1])
+            model.addConstr(delta[i, b] == zeta[i, b])
+            model.addConstr(delta[i, b-1] == zeta[i, b-1])
 #3D 不需要
 # for i in Nobb1.get(1, []):  # Nobb1[1] 是 1,2 重疊的客戶
 #     model.addConstr(delta[i, 1] == zeta[i, 1])
@@ -358,7 +419,7 @@ for b in Ab:
     for (i, j) in Ab[b]:
         if i != 0 and j != 0:
             model.addConstr(
-                psi[i, j, b] <= (delta[i, b] + delta[j, b]) / 2,
+                psi[i, j, b] <= (delta[i, b] - kappa[i, b]  + delta[j, b] - kappa[j, b]) / 2,
             )
 #3G
 for b in Ab:
@@ -369,7 +430,7 @@ for b in Ab:
 
     for j in Nb[b]:  # j ∈ N_b
         model.addConstr(
-            quicksum(psi[i, j, b] for (i, j) in incoming.get(j, [])) == delta[j, b],
+            quicksum(psi[i, j, b] for (i, j) in incoming.get(j, [])) == delta[j, b] - kappa[j, b],
         )
 
 #3H
@@ -381,33 +442,40 @@ for b in Ab:
 
     for j in Nb[b]:  # j ∈ N_b
         model.addConstr(
-            quicksum(psi[j, k, b] for (j, k) in incoming.get(j, [])) == delta[j, b],
+            quicksum(psi[j, k, b] for (j, k) in incoming.get(j, [])) == delta[j, b] - kappa[j, b],
         )
-#3I
+# (3I)  delta[j,b] - kappa[j,b] <= eps[b]
 for b in Ab:
-    if Neb.get(b):  # 非重疊客戶存在
-        depot_outgoing = [(i, j) for (i, j) in Ab[b] if i == 0]
-        if depot_outgoing:  # 保險起見，檢查是否有 (0,v)
-            model.addConstr(
-                quicksum(psi[i, j, b] for (i, j) in depot_outgoing) == 1,
-            )
-#3J
-for b in Ab:
-    if Neb.get(b):  # 非重疊客戶存在
-        depot_outgoing = [(i, j) for (i, j) in Ab[b] if i == 0]
-        if depot_outgoing:  # 保險起見，檢查是否有 (0,v)
-            model.addConstr(
-                quicksum(psi[i, j, b] for (i, j) in depot_outgoing) <= 1,
-            )
-#3K
-for b in Ab:
-    from_depot = [(i, j) for (i, j) in Ab[b] if i == 0]
-    to_depot = [(i, j) for (i, j) in Ab[b] if j == 0]
+    for j in Nb.get(b, set()):
+        if 1 <= j <= N:  # 只對客戶節點，避開 depot=0 或其他非客戶編號
+            model.addConstr(delta[j, b] - kappa[j, b] <= eps[b],
+                            name=f"3I[{j},{b}]")
 
+# (3J)  sum_{j in Nb[b]} (delta[j,b] - kappa[j,b]) >= eps[b]
+for b in Ab:
     model.addConstr(
-        quicksum(psi[i, j, b] for (i, j) in from_depot) ==
-        quicksum(psi[i, j, b] for (i, j) in to_depot),
+        quicksum(delta[j, b] - kappa[j, b]
+                    for j in Nb.get(b, set())
+                    if 1 <= j <= N) >= eps[b],
+        name=f"3J[{b}]"
     )
+# (3K1) depot outgoing flow equals h[b]
+for b in Ab:
+    model.addConstr(
+        quicksum(psi[0, v, b] for (u, v) in Ab.get(b, set()) if u == 0) == hb[b],
+        name=f"3K1[{b}]"
+    )
+
+
+# (3K2) depot incoming flow equals h[b]
+for b in Ab:
+    model.addConstr(
+        quicksum(psi[u, 0, b] for (u, v) in Ab.get(b, set()) if v == 0) == hb[b],
+        name=f"3K2[{b}]"
+    )
+
+for b in Ab:
+    model.addConstr(hb[b] == eps[b], name=f"link_hb_eps[{b}]")
 
 #4
 for (i, j) in A:
@@ -534,16 +602,18 @@ for i in range(1, N + 1):
             x[i, t] + quicksum(alpha[i, t, o] * lito[i][t-1][o] for o in range(O)) <= L + M*omega[i]
         )
         model.addConstr(
-            y[i, t] + quicksum(alpha[i, t, o] * wito[i][t-1][o] for o in range(O)) <= W 
+            y[i, t] + quicksum(alpha[i, t, o] * wito[i][t-1][o] for o in range(O)) <= W +M*omega[i]
         )
         model.addConstr(
-            z[i, t] + quicksum(alpha[i, t, o] * hito[i][t-1][o] for o in range(O)) <= H 
+            z[i, t] + quicksum(alpha[i, t, o] * hito[i][t-1][o] for o in range(O)) <= H + M*omega[i]
         )
 
 #26P
 for (i, j) in A:
     if i != 0 and j != 0:
         model.addConstr(omega[j] >= omega[i] + gamma[i,j] - 1)
+
+
 
 model.optimize()
 
@@ -723,7 +793,52 @@ print("==============================\n")
 #     else:
 #         print(f"區域 {b} 的總裝載材積為：0 單位³")
 
+print("\n==============================")
+print(" Obj1 Breakdown Check ")
+print("==============================")
 
+# --- (A) Outsourcing Cost ---
+outsourcing_cost = 0
+outsourcing_detail = []
+
+for i in range(1, N+1):
+    if omega[i].X > 0.5:
+        cost_i = C0 * vi[i]
+        outsourcing_cost += cost_i
+        outsourcing_detail.append((i, vi[i], cost_i))
+
+print("\n[Obj1-A] Outsourcing Cost =", outsourcing_cost)
+print("[Obj1-A Details] (customer, vi, contribution)")
+for item in outsourcing_detail:
+    print(" ", item)
+
+
+# --- (B) Self-owned Fuel / Arc Cost ---
+fuel_cost = 0
+selected_arcs = []
+
+for b in Ab:
+    for (i, j) in Ab[b]:
+        if psi[i, j, b].X > 0.5:
+            arc_cost = g[b, i, j]
+            fuel_cost += arc_cost
+            selected_arcs.append((b, i, j, arc_cost))
+
+print("\n[Obj1-B] Fuel / Arc Cost =", fuel_cost)
+print("[Obj1-B Details] (b, i, j, cost)")
+for arc in selected_arcs:
+    print(" ", arc)
+
+
+# --- Final Check ---
+total_manual = outsourcing_cost + fuel_cost
+
+print("\n[Obj1 Manual Sum] =", total_manual)
+
+try:
+    print("[Obj1 Model Value] =", obj1.getValue())
+except:
+    print("[Obj1 Model Value] cannot access obj1 directly (multi-objective mode)")
 print("\n===顧客被分至外包車")
 for i in range(1, N + 1):
     if omega[i].X > 0.01:  # 避免浮點誤差影響
