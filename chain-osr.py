@@ -114,7 +114,7 @@ N0 = 49 # 節點數量(包含倉庫和客戶節點)
 O = 6   # 旋轉方向
 L, W, H = 300,170,165  #貨櫃長寬高
 M = 1e6  # 極大值
-C0 = 6   #每單位才積委外的費用
+C0 = 20   #每單位才積委外的費用
 vi = {}  #客戶 i 所有貨物的總才積
 vit = {} #客戶 i 的第 t 件貨物的才積
 
@@ -485,21 +485,21 @@ for (i, j) in A:
         )
 
 #gamma設計
-for i in range(1, N): 
-    for j in range(1, N): 
-        for k in range(1, N): 
+for i in range(1, N+1): 
+    for j in range(1, N+1): 
+        for k in range(1, N+1): 
             if i != j and i != k and j != k: 
                 model.addConstr(
                     gamma[i, j] + gamma[j, k] <= 1 + gamma[i, k],
                 )
 
-for i in range(1, N): 
-    for j in range(1, N):
+for i in range(1, N+1): 
+    for j in range(1, N+1):
         if i != j:
            model.addConstr(gamma[i, j] + gamma[j, i] <= 1) 
 
-for i in range(1, N):  
-    for j in range(1, N):  
+for i in range(1, N+1):  
+    for j in range(1, N+1):  
         if i != j:  
             for b in range(1, Z + 1):  
                 for bprime in range(1, Z + 1):
@@ -508,16 +508,16 @@ for i in range(1, N):
                             gamma[i, j] + gamma[j, i] <= 2 - delta[i, b] - delta[j, bprime],
                         )
 
-for i in range(1, N):  
-    for j in range(1, N):  
+for i in range(1, N+1):  
+    for j in range(1, N+1):  
         if i != j:  
             for b in range(1, Z + 1):  
                 model.addConstr(
                     gamma[i, j] + gamma[j, i] >= 1 - (2 - delta[i, b] - delta[j, b])
                 )
 #5A
-for i in range(1, N):  
-    for j in range(1, N):  
+for i in range(1, N+1):  
+    for j in range(1, N+1):  
         if i != j:
             for t in range(1, Gi[i] + 1):
                 for tprime in range(1, Gi[j] + 1):
@@ -528,8 +528,8 @@ for i in range(1, N):
                     )
 
 #5B
-for i in range(1, N):  
-    for j in range(1, N):  
+for i in range(1, N+1):  
+    for j in range(1, N+1):  
         if i != j:
             for t in range(1, Gi[i] + 1):
                 for tprime in range(1, Gi[j] + 1):
@@ -577,23 +577,28 @@ for i in range(1, N + 1):
     for t in range(1, Gi[i] + 1):
         model.addConstr(quicksum(alpha[i, t, o] for o in range(O)) == 1)
 
-#6B~D 
+#6B~D (修正版：外包時退出 non-overlap)
 for i in range(1, N+1):
     for t in range(1, Gi[i] + 1):
         for j in range(1, N+1):
             for tprime in range(1, Gi[j] + 1):
                 if (i == j and t != tprime) or (i != j):
+
+                    size_i_L = quicksum(alpha[i, t, o] * lito[i][t-1][o] for o in range(O))
+                    size_i_W = quicksum(alpha[i, t, o] * wito[i][t-1][o] for o in range(O))
+                    size_i_H = quicksum(alpha[i, t, o] * hito[i][t-1][o] for o in range(O))
+
                     model.addConstr(
-                        x[i, t] + quicksum(alpha[i, t, o] * lito[i][t-1][o] for o in range(O)) 
-                        <= x[j, tprime] + M * (1 - xprime[i, t, j, tprime]),
+                        x[i, t] + size_i_L
+                        <= x[j, tprime] + M * (1 - xprime[i, t, j, tprime]) 
                     )
                     model.addConstr(
-                        y[i, t] + quicksum(alpha[i, t, o] * wito[i][t-1][o] for o in range(O)) 
-                        <= y[j, tprime] + M * (1 - yprime[i, t, j, tprime]),
+                        y[i, t] + size_i_W
+                        <= y[j, tprime] + M * (1 - yprime[i, t, j, tprime]) 
                     )
                     model.addConstr(
-                        z[i, t] + quicksum(alpha[i, t, o] * hito[i][t-1][o] for o in range(O)) 
-                        <= z[j, tprime] + M * (1 - zprime[i, t, j, tprime]),
+                        z[i, t] + size_i_H
+                        <= z[j, tprime] + M * (1 - zprime[i, t, j, tprime]) 
                     )
 #6E~F 
 for i in range(1, N + 1):
@@ -602,16 +607,23 @@ for i in range(1, N + 1):
             x[i, t] + quicksum(alpha[i, t, o] * lito[i][t-1][o] for o in range(O)) <= L + M*omega[i]
         )
         model.addConstr(
-            y[i, t] + quicksum(alpha[i, t, o] * wito[i][t-1][o] for o in range(O)) <= W +M*omega[i]
+            y[i, t] + quicksum(alpha[i, t, o] * wito[i][t-1][o] for o in range(O)) <= W  + M*omega[i]
         )
         model.addConstr(
-            z[i, t] + quicksum(alpha[i, t, o] * hito[i][t-1][o] for o in range(O)) <= H + M*omega[i]
+            z[i, t] + quicksum(alpha[i, t, o] * hito[i][t-1][o] for o in range(O)) <= H  + M*omega[i]
         )
 
 #26P
-for (i, j) in A:
-    if i != 0 and j != 0:
-        model.addConstr(omega[j] >= omega[i] + gamma[i,j] - 1)
+#for (i, j) in A:
+ #   if i != 0 and j != 0:
+  #      model.addConstr(omega[j] >= omega[i] + gamma[i,j] - 1)
+for b in range(1, Z+1):
+    for i in range(1, N+1):
+        for j in range(1, N+1):
+            if i != j:
+                model.addConstr(
+                    kappa[j,b] >= kappa[i,b] + gamma[i,j] + delta[i,b] + delta[j,b] - 3
+                )
 
 
 
@@ -851,6 +863,58 @@ for i in range(1, N + 1):
             if gamma[i,j].X > 0.01:  # 避免浮點誤差影響
                 print(f"顧客 {i} {j} 有先後順序")
 
+# ---- Debug: print delta/kappa/served for outsourced customers ----
+def v(x):
+    """Safe value getter for Gurobi vars (handles None)."""
+    if x is None:
+        return None
+    try:
+        return x.X
+    except:
+        try:
+            return x.x
+        except:
+            return None
+
+# 1) 找出外包客戶
+outsourced = []
+for i in range(1, N + 1):
+    if v(omega[i]) is not None and v(omega[i]) > 0.5:
+        outsourced.append(i)
+
+print("\n[DEBUG] Outsourced customers (omega=1):", outsourced if outsourced else "None")
+
+# 2) 對每個外包客戶，印 delta/kappa/delta-kappa
+#    b 的集合用你模型裡實際存在的區域 key：優先用 Ab.keys()，不然用 1..Z
+try:
+    B_list = sorted(list(Ab.keys()))
+except:
+    B_list = list(range(1, Z + 1))
+
+for i in outsourced:
+    print(f"\n[DEBUG] Customer i={i}, omega={v(omega[i])}")
+
+    # 找 i 被分到的區（delta=1 的那個）
+    assigned_bs = []
+    for b in B_list:
+        if (i, b) in delta:
+            dv = v(delta[i, b])
+            if dv is not None and dv > 0.5:
+                assigned_bs.append(b)
+    print("  assigned b (delta=1):", assigned_bs if assigned_bs else "None")
+
+    # 印每個 b 的 delta/kappa/served
+    for b in B_list:
+        if (i, b) not in delta or (i, b) not in kappa:
+            continue
+        dv = v(delta[i, b])
+        kv = v(kappa[i, b])
+        if dv is None or kv is None:
+            continue
+        served = dv - kv
+        # 只印有關聯的（delta 或 kappa 有 1 的）
+        if dv > 0.5 or kv > 0.5:
+            print(f"  b={b}: delta={dv:.0f}, kappa={kv:.0f}, delta-kappa={served:.0f}")
 
 area_stacks = {b: [] for b in range(1, Z + 1)}
     
@@ -897,3 +961,4 @@ for b in range(1, Z + 1):
                     "尺寸": (length, width, height)
                 })
 plot_vehicle_stacks(area_stacks, L, W, H)
+
