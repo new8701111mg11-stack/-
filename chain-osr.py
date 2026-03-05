@@ -338,11 +338,6 @@ z = model.addVars(
     name="z"
 )  # Box Z-coordinate
 
-R = model.addVars(
-    range(1, Z + 1),
-    vtype=GRB.CONTINUOUS,
-    name="R"
-) #第b區自有車輛裝載總才積
 
 # --- New variable: epsilon_b ---
 eps = model.addVars(range(1, Z+1), vtype=GRB.BINARY, name="eps")
@@ -351,8 +346,7 @@ eps = model.addVars(range(1, Z+1), vtype=GRB.BINARY, name="eps")
 # --- New variable: h_b (whether self-owned truck in area b is used) ---
 hb = model.addVars(range(1, Z+1), vtype=GRB.BINARY, name="hb")
 
-R_max = model.addVar(vtype=GRB.CONTINUOUS, name="R_max") #所有自有車輛服務區域之最大裝載總才積
-R_min = model.addVar(vtype=GRB.CONTINUOUS, name="R_min") #所有自有車輛服務區域之最小裝載總才積
+
 
 #目標式
 obj1 = quicksum(C0 * vi[i] * omega[i] for i in range(1, N+1))   # 第一層目標（較重要）
@@ -361,26 +355,9 @@ obj1 += quicksum(
     for b in Ab              # 用 Ab 的 key
     for (i, j) in Ab[b]
 )
-obj2 = R_max - R_min   
+  
 
-model.ModelSense = GRB.MINIMIZE
-model.setObjectiveN(obj1, index=0, priority=2, name="primary_cost")
-model.setObjectiveN(obj2, index=1, priority=1, name="balance")
-
-#目標式計算相關
-for b in range(1, Z + 1):
-    model.addConstr(R_max >= R[b])
-
-for b in range(1, Z + 1):
-    model.addConstr(R_min <= R[b])
-
-for b in range(1, Z + 1):
-    model.addConstr(
-        R[b] == quicksum(
-            vi[i] * (delta[i, b] - kappa[i, b])
-            for i in Nb[b]
-        )
-    )
+model.setObjective(obj1, GRB.MINIMIZE)
 
 #輔助變數相關
 for b in range(1, Z + 1): 
