@@ -111,10 +111,13 @@ model = Model("ChainOsr")
 Z = 4    # 區域數量
 N = 12  # 客戶數量
 N0 = 49 # 節點數量(包含倉庫和客戶節點)
+SCALE = 1.25
 O = 6   # 旋轉方向
 L, W, H = 300,170,165  #貨櫃長寬高
 M = 1e6  # 極大值
-C0 = 20   #每單位才積委外的費用
+C0 = 6   #每單位才積委外的費用
+C1 = 5.41
+P0 = 1000
 vi = {}  #客戶 i 所有貨物的總才積
 vit = {} #客戶 i 的第 t 件貨物的才積
 
@@ -143,18 +146,27 @@ with open(os.path.join(base_dir, "customerInfo.csv"), newline='', encoding='utf-
         cargo_count = int(row['貨物數'].strip())
         totalVolume = float(row['總才積'].strip())
         Gi[customer_id] = cargo_count
-        vi[customer_id] = totalVolume
+        vi[customer_id] = totalVolume * SCALE
 
 with open(os.path.join(base_dir, "goods.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         customer_id = int(row['客戶'])
         t = int(row['貨物'])
-        cargoVolume =float(row['材積'])
-        good_l = int(row['長'])
-        good_w = int(row['寬'])
-        good_h = int(row['高'])
+        cargoVolume = float(row['材積'])
+
+        good_l = float(row['長'])
+        good_w = float(row['寬'])
+        good_h = float(row['高'])
         fragile = int(row['脆弱性'])  # 0 或 1
+
+        volume_scale = SCALE   # 例如 1.0 / 1.25 / 1.5 / 1.75 / 2.0
+        length_scale = volume_scale ** (1/3)
+
+        good_l *= length_scale
+        good_w *= length_scale
+        good_h *= length_scale
+        cargoVolume *= volume_scale
 
         # 定義 6 種方向的 (l, w, h) 排列
         orientation_results = [
@@ -214,7 +226,7 @@ with open(os.path.join(base_dir, "serviceArea.csv"), newline='', encoding='utf-8
     Neb = OrderedDict((k, sorted(v)) for k, v in sorted(Neb.items()))
     Nobb1 = OrderedDict((k, sorted(v)) for k, v in sorted(Nobb1.items()))
 # print(Nobb1)
-with open(os.path.join(base_dir, "routes.csv"), newline='', encoding='utf-8-sig') as csvfile:
+with open(os.path.join(base_dir, "routes_star.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         area = int(row['區域'])
@@ -225,7 +237,7 @@ with open(os.path.join(base_dir, "routes.csv"), newline='', encoding='utf-8-sig'
                     Nb[area+1].append(int(value))
     Nb = dict(Nb) 
 # print(Nb)
-with open(os.path.join(base_dir, "routeArcs.csv"), newline='', encoding='utf-8-sig') as csvfile:
+with open(os.path.join(base_dir, "routeArcs_star.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         area = int(row['區域'])
@@ -280,6 +292,12 @@ omega = model.addVars(
     range(1, N + 1),
     vtype=GRB.BINARY,
     name="omega"
+)#若客戶節點 i 被分配至外包車
+
+si = model.addVars(
+    range(1, N + 1),
+    vtype=GRB.BINARY,
+    name="si"
 )#若客戶節點 i 被分配至外包車
 
 kappa = model.addVars(
@@ -346,15 +364,31 @@ eps = model.addVars(range(1, Z+1), vtype=GRB.BINARY, name="eps")
 # --- New variable: h_b (whether self-owned truck in area b is used) ---
 hb = model.addVars(range(1, Z+1), vtype=GRB.BINARY, name="hb")
 
+# overflow indicators
+ux, uy, uz = {}, {}, {}
+for i in range(1, N + 1):
+    for t in range(1, Gi[i] + 1):
+        ux[i, t] = model.addVar(vtype=GRB.BINARY, name=f"ux[{i},{t}]")
+        uy[i, t] = model.addVar(vtype=GRB.BINARY, name=f"uy[{i},{t}]")
+        uz[i, t] = model.addVar(vtype=GRB.BINARY, name=f"uz[{i},{t}]")
 
 
+
+
+outsourceFee = {}
+for i in range(1, N + 1):
+    vol = vi[i]              # 客戶 i 的總才積
+    v = math.ceil(vol)       # 不到 1 才以 1 才計
+    outsourceFee[i] = 100 + 30 * max(0, v - 1)
 #目標式
-obj1 = quicksum(C0 * vi[i] * omega[i] for i in range(1, N+1))   # 第一層目標（較重要）
+obj1 = quicksum(outsourceFee[i] * omega[i] for i in range(1, N+1))   # 第一層目標（較重要）
 obj1 += quicksum(
-    g[b, i, j] * psi[i, j, b]
+    g[b, i, j] * psi[i, j, b] *C1 
     for b in Ab              # 用 Ab 的 key
     for (i, j) in Ab[b]
 )
+
+#obj1 += quicksum(P0 * omega[i] for i in range(1, N+1)) 
   
 
 model.setObjective(obj1, GRB.MINIMIZE)
@@ -577,6 +611,8 @@ for i in range(1, N+1):
                         z[i, t] + size_i_H
                         <= z[j, tprime] + M * (1 - zprime[i, t, j, tprime]) 
                     )
+
+    
 #6E~F 
 for i in range(1, N + 1):
     for t in range(1, Gi[i] + 1):
@@ -589,6 +625,7 @@ for i in range(1, N + 1):
         model.addConstr(
             z[i, t] + quicksum(alpha[i, t, o] * hito[i][t-1][o] for o in range(O)) <= H  + M*omega[i]
         )
+
 
 #26P
 #for (i, j) in A:
@@ -809,7 +846,7 @@ selected_arcs = []
 for b in Ab:
     for (i, j) in Ab[b]:
         if psi[i, j, b].X > 0.5:
-            arc_cost = g[b, i, j]
+            arc_cost = C1*g[b, i, j]
             fuel_cost += arc_cost
             selected_arcs.append((b, i, j, arc_cost))
 
@@ -895,6 +932,38 @@ for i in outsourced:
 
 area_stacks = {b: [] for b in range(1, Z + 1)}
     
+i = 12
+print(f"\n[DEBUG customer {i}]")
+print("omega =", omega[i].X)
+print("si    =", si[i].X)
+
+for t in range(1, Gi[i] + 1):
+    placed_L = sum(alpha[i, t, o].X * lito[i][t-1][o] for o in range(O))
+    placed_W = sum(alpha[i, t, o].X * wito[i][t-1][o] for o in range(O))
+    placed_H = sum(alpha[i, t, o].X * hito[i][t-1][o] for o in range(O))
+
+    print(f"  item t={t}")
+    print("    x,y,z =", x[i, t].X, y[i, t].X, z[i, t].X)
+    print("    placed_L/W/H =", placed_L, placed_W, placed_H)
+
+    if (i, t) in ux:
+        print("    ux,uy,uz =", ux[i, t].X, uy[i, t].X, uz[i, t].X)
+
+    print("    x+L - L =", x[i, t].X + placed_L - L)
+    print("    y+W - W =", y[i, t].X + placed_W - W)
+    print("    z+H - H =", z[i, t].X + placed_H - H)
+
+    print("\n[DEBUG outsourced customers]")
+for i in range(1, N + 1):
+    if omega[i].X > 0.5:
+        print(f"\ncustomer {i}: omega={omega[i].X}, si={si[i].X}")
+        for t in range(1, Gi[i] + 1):
+            vals = []
+            if (i, t) in ux:
+                vals = [ux[i, t].X, uy[i, t].X, uz[i, t].X]
+            print(f"  t={t}, overflow flags={vals}")
+
+    
 for b in range(1, Z + 1):
     for i in range(1, N):  # 客戶節點
         if delta[i, b].x > 0.5:  # 如果客戶分配給車輛 v
@@ -938,4 +1007,3 @@ for b in range(1, Z + 1):
                     "尺寸": (length, width, height)
                 })
 plot_vehicle_stacks(area_stacks, L, W, H)
-
