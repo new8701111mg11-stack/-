@@ -111,13 +111,13 @@ model = Model("ChainOsr")
 Z = 4    # 區域數量
 N = 12  # 客戶數量
 N0 = 49 # 節點數量(包含倉庫和客戶節點)
-SCALE = 1.25
+SCALE = 1.5
 O = 6   # 旋轉方向
 L, W, H = 300,170,165  #貨櫃長寬高
 M = 1e6  # 極大值
 C0 = 6   #每單位才積委外的費用
 C1 = 5.41
-P0 = 1000
+P0 = 0
 vi = {}  #客戶 i 所有貨物的總才積
 vit = {} #客戶 i 的第 t 件貨物的才積
 
@@ -226,7 +226,7 @@ with open(os.path.join(base_dir, "serviceArea.csv"), newline='', encoding='utf-8
     Neb = OrderedDict((k, sorted(v)) for k, v in sorted(Neb.items()))
     Nobb1 = OrderedDict((k, sorted(v)) for k, v in sorted(Nobb1.items()))
 # print(Nobb1)
-with open(os.path.join(base_dir, "routes_star.csv"), newline='', encoding='utf-8-sig') as csvfile:
+with open(os.path.join(base_dir, "routes.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         area = int(row['區域'])
@@ -237,7 +237,7 @@ with open(os.path.join(base_dir, "routes_star.csv"), newline='', encoding='utf-8
                     Nb[area+1].append(int(value))
     Nb = dict(Nb) 
 # print(Nb)
-with open(os.path.join(base_dir, "routeArcs_star.csv"), newline='', encoding='utf-8-sig') as csvfile:
+with open(os.path.join(base_dir, "routeArcs.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         area = int(row['區域'])
@@ -388,7 +388,7 @@ obj1 += quicksum(
     for (i, j) in Ab[b]
 )
 
-#obj1 += quicksum(P0 * omega[i] for i in range(1, N+1)) 
+obj1 += quicksum(P0 * omega[i] for i in range(1, N+1)) 
   
 
 model.setObjective(obj1, GRB.MINIMIZE)
@@ -823,19 +823,35 @@ print("\n==============================")
 print(" Obj1 Breakdown Check ")
 print("==============================")
 
-# --- (A) Outsourcing Cost ---
-outsourcing_cost = 0
-outsourcing_detail = []
+# --- (A1) Outsourcing Base Cost ---
+outsourcing_base_cost = 0
+outsourcing_base_detail = []
 
-for i in range(1, N+1):
+for i in range(1, N + 1):
     if omega[i].X > 0.5:
-        cost_i = C0 * vi[i]
-        outsourcing_cost += cost_i
-        outsourcing_detail.append((i, vi[i], cost_i))
+        cost_i = outsourceFee[i]
+        outsourcing_base_cost += cost_i
+        outsourcing_base_detail.append((i, vi[i], outsourceFee[i], cost_i))
 
-print("\n[Obj1-A] Outsourcing Cost =", outsourcing_cost)
-print("[Obj1-A Details] (customer, vi, contribution)")
-for item in outsourcing_detail:
+print("\n[Obj1-A1] Outsourcing Base Cost =", outsourcing_base_cost)
+print("[Obj1-A1 Details] (customer, vi, outsourceFee[i], contribution)")
+for item in outsourcing_base_detail:
+    print(" ", item)
+
+
+# --- (A2) Outsourcing Penalty Cost ---
+penalty_cost = 0
+penalty_detail = []
+
+for i in range(1, N + 1):
+    if omega[i].X > 0.5:
+        cost_i = P0
+        penalty_cost += cost_i
+        penalty_detail.append((i, cost_i))
+
+print("\n[Obj1-A2] Outsourcing Penalty Cost =", penalty_cost)
+print("[Obj1-A2 Details] (customer, penalty)")
+for item in penalty_detail:
     print(" ", item)
 
 
@@ -846,18 +862,18 @@ selected_arcs = []
 for b in Ab:
     for (i, j) in Ab[b]:
         if psi[i, j, b].X > 0.5:
-            arc_cost = C1*g[b, i, j]
+            arc_cost = C1 * g[b, i, j]
             fuel_cost += arc_cost
-            selected_arcs.append((b, i, j, arc_cost))
+            selected_arcs.append((b, i, j, g[b, i, j], arc_cost))
 
 print("\n[Obj1-B] Fuel / Arc Cost =", fuel_cost)
-print("[Obj1-B Details] (b, i, j, cost)")
+print("[Obj1-B Details] (b, i, j, distance, contribution)")
 for arc in selected_arcs:
     print(" ", arc)
 
 
 # --- Final Check ---
-total_manual = outsourcing_cost + fuel_cost
+total_manual = outsourcing_base_cost + penalty_cost + fuel_cost
 
 print("\n[Obj1 Manual Sum] =", total_manual)
 
@@ -865,6 +881,8 @@ try:
     print("[Obj1 Model Value] =", obj1.getValue())
 except:
     print("[Obj1 Model Value] cannot access obj1 directly (multi-objective mode)")
+
+
 print("\n===顧客被分至外包車")
 for i in range(1, N + 1):
     if omega[i].X > 0.01:  # 避免浮點誤差影響

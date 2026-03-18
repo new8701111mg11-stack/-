@@ -12,6 +12,82 @@
 
 using namespace std;
 
+static double printRouteArcsAndDistance(const Data& parameters, int area, const std::vector<int>& seq) {
+    if (seq.empty()) {
+        std::cerr << "Area " << area << " route empty -> dist=0\n";
+        return 0.0;
+    }
+
+    double sum = 0.0;
+
+    // depot -> first
+    double c = parameters.getDistance(0, seq.front());
+    sum += c;
+    std::cerr << "Area " << area << " arcs:\n";
+    std::cerr << "  (" << 0 << " -> " << seq.front() << ") cost=" << c << "\n";
+
+    // internal
+    for (int k = 0; k + 1 < (int)seq.size(); ++k) {
+        c = parameters.getDistance(seq[k], seq[k + 1]);
+        sum += c;
+        std::cerr << "  (" << seq[k] << " -> " << seq[k + 1] << ") cost=" << c << "\n";
+    }
+
+    // last -> depot
+    c = parameters.getDistance(seq.back(), 0);
+    sum += c;
+    std::cerr << "  (" << seq.back() << " -> " << 0 << ") cost=" << c << "\n";
+
+    std::cerr << "  Area " << area << " dist sum = " << sum << "\n";
+    return sum;
+}
+
+static void printObj1BreakdownDistance(const Individual& indiv,
+                                       const Data& parameters,
+                                       double C0 = 6.0,
+                                       double C1 = 0.541) {
+    std::vector<int> outsourced;
+    {
+        std::unordered_set<int> outsSet;
+        for (const auto& t : indiv.rentedTrucks) {
+            for (const auto& g : t.assignedCargo) {
+                outsSet.insert(g.customerId);
+            }
+        }
+        outsourced.assign(outsSet.begin(), outsSet.end());
+        std::sort(outsourced.begin(), outsourced.end());
+    }
+
+    double outsourcedCost = 0.0;
+    for (int cid : outsourced) {
+        if (cid <= 0) continue;
+        outsourcedCost += C0 * (double)parameters.totalVolume[cid - 1];
+    }
+
+    double rawSelfDist = 0.0;
+    for (int area = 1; area <= regionNum; ++area) {
+        rawSelfDist += printRouteArcsAndDistance(parameters, area, indiv.selfOwnedTrucks[area].route);
+    }
+
+    double weightedSelfFuel = C1 * rawSelfDist;
+    double manualObj = outsourcedCost + weightedSelfFuel;
+
+    std::cerr << "\n==============================\n";
+    std::cerr << " GA Obj1 Breakdown Check (Distance)\n";
+    std::cerr << "==============================\n";
+    std::cerr << "[Obj1-A] outsourcing (C0*totalVolume)      = " << outsourcedCost << "\n";
+    std::cerr << "  outsourced customers = ";
+    if (outsourced.empty()) std::cerr << "(none)";
+    for (int cid : outsourced) std::cerr << cid << " ";
+    std::cerr << "\n";
+
+    std::cerr << "[Obj1-B1] self-owned raw distance          = " << rawSelfDist << "\n";
+    std::cerr << "[Obj1-B2] weighted self-owned fuel (C1*d)  = " << weightedSelfFuel << "\n";
+    std::cerr << "[Obj1 Manual Sum]                          = " << manualObj << "\n";
+    std::cerr << "[indiv.fitness[0]] (current)               = "
+              << (indiv.fitness.empty() ? -1 : indiv.fitness[0]) << "\n";
+    std::cerr << "==============================\n\n";
+}
 struct Box {
     int x, y, z;
     int l, w, h;
@@ -132,12 +208,12 @@ static int checkIndividualPlacement(const Individual& ind,
     return viol;
 }
 // GA 比較（你原本那個，保留）
-static bool isBetter(const Individual& a, const Individual& b) {
+/*static bool isBetter(const Individual& a, const Individual& b) {
     const auto& fa = a.fitness;
     const auto& fb = b.fitness;
     if (fa[1] != fb[1]) return fa[1] < fb[1];
     return fa[0] < fb[0];
-}
+}*/
 /*
 // seed 分區 area(1..regionNum) -> undecodedServiceArea code（讓 decode 後等於 targetArea）
 static int serviceAreaToUndecodedCode(const Data& p, int customerId, int targetArea) {
@@ -198,7 +274,7 @@ int main(){
     auto t_start = Clock::now();
     srand(time(NULL));
     int noImproveCount = 0;
-    const int patience = 1500;
+    const int patience = 500;
     double C0 = 6;
     int noImproveObj1Count = 0;
     bool obj2LsArmed = false;
@@ -208,7 +284,7 @@ int main(){
     int obj2LsRuns = 0;
     const int OBJ2_LS_MAX_RUNS = 300;     
     // 讀檔
-    string folder = "datasets/N11_A4_SS20250102";
+    string folder = "datasets/N12_A4_S20250102";
     Data parameters;
     readParameters(
     folder + "/customerInfo.csv",
@@ -217,6 +293,9 @@ int main(){
     folder + "/routes.csv",
     parameters
 );
+if (!parameters.loadSolomonXY("matrix/C101.txt")) {
+    return 1;
+}
 
     // 編碼 & 初始母體生成
     vector<Individual> population = initializePopulation(populationSize, parameters);
@@ -322,9 +401,9 @@ int main(){
             ++noImproveCount;
         }
         cout << "Generation " << generation
-        << " global best fitness so far -> "
-        << "f[1] (rented cost) = " << globalBest.fitness[1]
-        << ", f[0] (volume diff) = " << globalBest.fitness[0] << '\n';
+     << " global best fitness so far -> "
+     << "cost = " << globalBest.fitness[0]
+     << '\n';
 
         if (noImproveCount >= patience) {
             cout << "No improvement in " << patience
@@ -341,8 +420,9 @@ int main(){
         population = crossoveredPopulation;
         // printChromosomeInfo(population[0]);
     }
+    
    // ====== Quick test: fixed swap (Area3 <-> Area4) then re-evaluate many times ======
-    auto cargoLookup_post = createCargoLookup(parameters);
+   /*  auto cargoLookup_post = createCargoLookup(parameters);
 
 // 1) 先確保 cand 是解碼過狀態（routeArea->decodedServiceArea一致）
     Individual cand = globalBest;
@@ -385,8 +465,8 @@ int main(){
     int worstT = -1;
 
 // 如果你有目標（例如 Gurobi 的 f0/f1），可以填這裡做命中判斷
-    long long targetF0 = /* optional: gurobi f0 */ -1;
-    long long targetF1 = /* optional: gurobi f1 */ -1;
+    long long targetF0 = -1;
+    long long targetF1 =  -1;
 
     bool hit = false;
 
@@ -445,7 +525,7 @@ int main(){
             Individual cand = globalBest; // 每次都從同一個「全域最佳」出發
 
     // 入口不 evaluate 的話：cand 必須帶著已經 evaluate 過的 trucks/fitness
-            localSearch_Obj2_TeacherStyle(cand, parameters, cargoLookup_post, /*repackRestarts=*/10);
+            localSearch_Obj2_TeacherStyle(cand, parameters, cargoLookup_post, 10);
 
     // 仍然需要 eval 一次才能比較（這一步會有隨機性）
             cand.fitness.clear();
@@ -469,14 +549,65 @@ int main(){
             cout << "[POST] Obj2-LS: no improving feasible move found" << POST_TRIES << " tries.\n";
         }
 
-    }   
+    }     */
     // ====== 所有世代跑完後，印「全程最佳染色體」的完整解 ======
     if (hasGlobalBest) {
         cout << "\n===== Global Best Solution =====\n";
-        cout << "Best fitness -> "
-             << "f[1] (rented cost) = " << globalBest.fitness[1]
-             << ", f[0] (volume diff) = " << globalBest.fitness[0] << '\n';
+        cout << "Best fitness -> cost = " << globalBest.fitness[0] << '\n';
 
+        // ==============================
+        // ==============================
+// GA Obj1 Breakdown Check (Global Best)
+// Obj1 = outsourcing_cost + self_owned_arc_cost
+// ==============================
+        printObj1BreakdownDistance(globalBest, parameters, 6.0);
+// (A) outsourcing cost: 用「客戶總才積」(對齊 Gurobi 的 C0 * v_i * omega_i)
+        long long GA_outsourcing = 0;
+        vector<int> outsourcedCustomers;
+
+        {
+            unordered_set<int> outsSet;
+
+    // 用 globalBest 的 rentedTrucks 組出外包客戶集合
+            for (const auto& rt : globalBest.rentedTrucks) {
+                for (const auto& g : rt.assignedCargo) {
+                    outsSet.insert(g.customerId);
+                }
+            }
+
+            outsourcedCustomers.assign(outsSet.begin(), outsSet.end());
+            sort(outsourcedCustomers.begin(), outsourcedCustomers.end());
+
+            for (int cid : outsourcedCustomers) {
+                GA_outsourcing += (long long)C0 * (long long)parameters.totalVolume[cid - 1];
+            }
+        }
+
+// (B) self-owned fuel cost: 用「弧數」近似 (g=1 時等同弧成本)
+// 每區 route 有 k 個客戶 => 弧數 = k+1 (0->first, ... , last->0)
+        long long GA_selfFuel = 0;
+        for (int area = 1; area <= regionNum; ++area) {
+            const auto& r = globalBest.selfOwnedTrucks[area].route;  // 注意：你的 Truck 要有 route 才行
+            int k = (int)r.size();
+            if (k > 0) GA_selfFuel += (k + 1);
+        }
+
+        long long GA_obj1_manual = GA_outsourcing + GA_selfFuel;
+
+// 你的 globalBest.fitness[1] 目前印的是 rented cost（或你已改成 Obj1）
+       double distSum = 0.0;
+        for (int area = 1; area <= regionNum; ++area) {
+            const auto& seq = globalBest.selfOwnedTrucks[area].route;
+            if (seq.empty()) continue;
+
+            distSum += parameters.getDistance(0, seq.front());
+            for (int k = 0; k + 1 < (int)seq.size(); ++k) {
+                distSum += parameters.getDistance(seq[k], seq[k+1]);
+            }
+            distSum += parameters.getDistance(seq.back(), 0);
+        }
+
+        std::cerr << "[Obj1-B] self-owned fuel (distance)  = " << distSum << "\n";
         // ===== 自有車：印路線 =====
         for (int i = 1; i <= regionNum; ++i) {
             const Truck& truck = globalBest.selfOwnedTrucks[i];
