@@ -21,6 +21,7 @@ const double crossoverRate = 0.8;
 const double mutationRate = 0.1;
 const double eliteRatio = 0.4;
 
+
 struct Cargo{
     int customerId;
     int cargoId;
@@ -36,6 +37,9 @@ struct Data{
     int serviceRegion[Customer][regionNum];
     vector <Cargo> cargoInformation;
     vector <int> route[regionNum];
+    unordered_map<int, pair<double,double>> solomonXY;
+    bool loadGeneratedXY(const std::string& filepath);
+    double getDistance(int i, int j) const;
 };
 
 struct Gene {
@@ -48,7 +52,19 @@ struct Gene {
     int decodedRotation = 0;       
     int position[3] = { -1, -1, -1 };
 };
+struct LoadingCache {
+    std::vector<std::unordered_set<std::string>> selfOwnedSuccessCache;
 
+    LoadingCache() {
+        selfOwnedSuccessCache.resize(regionNum + 1);
+    }
+
+    void clear() {
+        for (auto& s : selfOwnedSuccessCache) {
+            s.clear();
+        }
+    }
+};
 struct Truck{
     int truckId;
     int length = 300;
@@ -63,9 +79,10 @@ struct Individual {
     vector<Gene> chromosome;
     Truck selfOwnedTrucks[regionNum + 1];
     vector<Truck> rentedTrucks;
-    vector<long long> fitness; //第一個放才積差距，第二個放租用的成本
+    vector<double> fitness; //第一個放才積差距，第二個放租用的成本
     double rentedVehicleLoadingCost = 0.0;
     double maxVolumeDifferenceOfEachCar = 0.0;
+    std::vector<std::vector<int>> lastCustomerSet; 
 };
 
 class BLPlacement3D {
@@ -80,7 +97,8 @@ class BLPlacement3D {
 
         BLPlacement3D(int L, int W, int H) : containerL(L), containerW(W), containerH(H) {}
         void setCargoLookup(const unordered_map<int, unordered_map<int, Cargo>>& lookup);       
-        bool tryInsert(vector<Gene>& group, int  maxTries); 
+        bool tryInsert(vector<Gene>& group, int  maxTries);
+        
 
     private:
         Box getBoxFromGene(const Gene& g) {
@@ -100,7 +118,7 @@ class BLPlacement3D {
         bool placeBox(Box& box, const vector<Box>& currentBoxes);
         bool isWithinContainer(const Box& b);
         bool hasCollision(const Box& b, const vector<Box>& boxes);
-        bool isSupported(const Box& b, const vector<Box>& boxes);
+       
 };
 void readParameters(const string& customerInfo, const string& goods, const string& serviceArea, const string& routes, Data& parameter);
 void printData(const Data& data);

@@ -74,36 +74,23 @@ def plot_vehicle_stacks(vehicle_stacks, L, W, H):
         plt.show()
 import os
 
-def read_solomon_xy(filepath):
+def read_generated_coords(filepath):
     coords = {}
 
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
+    with open(filepath, newline='', encoding='utf-8-sig') as csvfile:
+        reader = csv.DictReader(csvfile)
 
-    # 找 CUSTOMER 表頭
-    start = None
-    for i, line in enumerate(lines):
-        if "CUST NO." in line and "XCOORD" in line:
-            start = i + 1
-            break
+        for row in reader:
+            try:
+                cust_id = int(row["客戶"])
+                x = float(row["x"])
+                y = float(row["y"])
+                coords[cust_id] = (x, y)
+            except:
+                continue
 
-    if start is None:
-        raise ValueError("找不到 CUSTOMER 表頭")
-
-    # 只讀前三欄：id, x, y
-    for line in lines[start:]:
-        parts = line.strip().split()
-        if len(parts) < 3:
-            continue
-
-        try:
-            cust_id = int(parts[0])
-            x = float(parts[1])
-            y = float(parts[2])
-        except:
-            continue
-
-        coords[cust_id] = (x, y)
+    # 加 depot
+    coords[0] = (50.0, 25.0)
 
     return coords
 
@@ -111,13 +98,13 @@ model = Model("ChainOsr")
 Z = 4    # 區域數量
 N = 12  # 客戶數量
 N0 = 49 # 節點數量(包含倉庫和客戶節點)
-SCALE = 1.5
+SCALE = 1
 O = 6   # 旋轉方向
 L, W, H = 300,170,165  #貨櫃長寬高
 M = 1e6  # 極大值
 C0 = 6   #每單位才積委外的費用
 C1 = 5.41
-P0 = 0
+P0 = 1000
 vi = {}  #客戶 i 所有貨物的總才積
 vit = {} #客戶 i 的第 t 件貨物的才積
 
@@ -127,9 +114,8 @@ hito = {} #客戶 i 的第 t 件貨物以擺放方向 o 時的高
 pito = {} #擺放方向指標
 fit = {}  #脆弱性貨物指標
 Gi = {}   #客戶 i 的貨物數量
-solomon_path =  r"datasets/C101.txt"
-coords = read_solomon_xy(solomon_path)
-
+coord_path = r"datasets/N12_A4_S20250102/generatedCoordinates.csv"
+coords = read_generated_coords(coord_path)
 
 print(coords[0])   # depot
 print(coords[1])   # customer 1
@@ -226,7 +212,7 @@ with open(os.path.join(base_dir, "serviceArea.csv"), newline='', encoding='utf-8
     Neb = OrderedDict((k, sorted(v)) for k, v in sorted(Neb.items()))
     Nobb1 = OrderedDict((k, sorted(v)) for k, v in sorted(Nobb1.items()))
 # print(Nobb1)
-with open(os.path.join(base_dir, "routes.csv"), newline='', encoding='utf-8-sig') as csvfile:
+with open(os.path.join(base_dir, "routes_star.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         area = int(row['區域'])
@@ -237,7 +223,7 @@ with open(os.path.join(base_dir, "routes.csv"), newline='', encoding='utf-8-sig'
                     Nb[area+1].append(int(value))
     Nb = dict(Nb) 
 # print(Nb)
-with open(os.path.join(base_dir, "routeArcs.csv"), newline='', encoding='utf-8-sig') as csvfile:
+with open(os.path.join(base_dir, "routeArcs_star.csv"), newline='', encoding='utf-8-sig') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         area = int(row['區域'])

@@ -15,8 +15,15 @@
 #include <omp.h>
 #include <limits>
 #include <cmath>
+#include <array>
+#include <map>
+#include <utility>
 
 using namespace std;
+const std::unordered_set<int> TEST_FORCED_OUTSOURCE = {};
+const std::unordered_set<int> TEST_FORCED_SELFOWNED = {};
+
+unordered_set<string> successCache;
 
 enum ReduceOp {
     opReinsertion = 0,   // rented -> self
@@ -24,7 +31,83 @@ enum ReduceOp {
     opExchange = 2       // swap rented<->self customer packs
 };
 
-// ===== Helper: 把一台 Truck 內的 assignedCargo 全部重排（repack） =====
+// ===== Helper: 從 rentedTrucks 移除某客戶 cid 的所有 Gene =====
+static void removeCustomerFromRented(Individual& ind, int cid)
+{
+    for (auto& rt : ind.rentedTrucks) {
+        auto& v = rt.assignedCargo;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [&](const Gene& g){ return g.customerId == cid; }),
+                v.end());
+        // route 也順便移掉（如果你 route 只是顯示用）
+        rt.route.erase(std::remove(rt.route.begin(), rt.route.end(), cid), rt.route.end());
+    }
+
+    // 刪掉空的 rented truck（可選，但通常要做）
+    ind.rentedTrucks.erase(
+        std::remove_if(ind.rentedTrucks.begin(), ind.rentedTrucks.end(),
+                       [&](const Truck& t){ return t.assignedCargo.empty(); }),
+        ind.rentedTrucks.end()
+    );
+}
+static std::vector<Gene> collectCustomerGenesFromRented(Individual& ind, int cid) {
+    std::vector<Gene> pack;
+
+    for (auto itTruck = ind.rentedTrucks.begin(); itTruck != ind.rentedTrucks.end(); ) {
+        Truck& rt = *itTruck;
+
+        std::vector<Gene> kept;
+        kept.reserve(rt.assignedCargo.size());
+
+        bool foundInThisTruck = false;
+
+        for (const auto& g : rt.assignedCargo) {
+            if (g.customerId == cid) {
+                pack.push_back(g);
+                foundInThisTruck = true;
+            } else {
+                kept.push_back(g);
+            }
+        }
+
+        if (foundInThisTruck) {
+            rt.assignedCargo.swap(kept);
+
+            // 重建 route：只保留還有貨的 customer，且不重複
+            std::vector<int> newRoute;
+            std::unordered_set<int> seen;
+            for (const auto& g : rt.assignedCargo) {
+                if (!seen.count(g.customerId)) {
+                    newRoute.push_back(g.customerId);
+                    seen.insert(g.customerId);
+                }
+            }
+            rt.route = newRoute;
+
+            // 重新計算 loadedVolume
+            rt.loadedVolume = 0;
+           
+
+            // 空車就刪掉
+            if (rt.assignedCargo.empty()) {
+                itTruck = ind.rentedTrucks.erase(itTruck);
+            } else {
+                ++itTruck;
+            }
+
+            // 一個 customer 理論上只會在一台 rented truck
+            break;
+        } else {
+            ++itTruck;
+        }
+    }
+
+    return pack;
+}
+// ==============================
+// Helper 2: 把某台車的 assignedCargo 全部重新裝箱
+// 成功就更新每個 Gene 的 position / rotation
+// ==============================
 static bool repackTruck(Truck& t,
                         const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
                         int maxTriesInsert = 500)
@@ -49,38 +132,6 @@ static bool repackTruck(Truck& t,
     return true;
 }
 
-// ===== Helper: 從 ind.rentedTrucks 裡收集某個客戶 cid 的所有 Gene（整包） =====
-static vector<Gene> collectCustomerGenesFromRented(const Individual& ind, int cid)
-{
-    vector<Gene> out;
-    for (const auto& rt : ind.rentedTrucks) {
-        for (const auto& g : rt.assignedCargo) {
-            if (g.customerId == cid) out.push_back(g);
-        }
-    }
-    return out;
-}
-
-// ===== Helper: 從 rentedTrucks 移除某客戶 cid 的所有 Gene =====
-static void removeCustomerFromRented(Individual& ind, int cid)
-{
-    for (auto& rt : ind.rentedTrucks) {
-        auto& v = rt.assignedCargo;
-        v.erase(std::remove_if(v.begin(), v.end(),
-                               [&](const Gene& g){ return g.customerId == cid; }),
-                v.end());
-        // route 也順便移掉（如果你 route 只是顯示用）
-        rt.route.erase(std::remove(rt.route.begin(), rt.route.end(), cid), rt.route.end());
-    }
-
-    // 刪掉空的 rented truck（可選，但通常要做）
-    ind.rentedTrucks.erase(
-        std::remove_if(ind.rentedTrucks.begin(), ind.rentedTrucks.end(),
-                       [&](const Truck& t){ return t.assignedCargo.empty(); }),
-        ind.rentedTrucks.end()
-    );
-}
-
 // ===== 核心 Move：嘗試把 cid 從 rented -> 自有車 area =====
 static bool tryMoveRentedCustomerToSelfTruck(Individual& ind,
                                             int cid, int area,
@@ -100,21 +151,29 @@ static bool tryMoveRentedCustomerToSelfTruck(Individual& ind,
     auto backupSelf = selfT.assignedCargo;
     auto backupRented = ind.rentedTrucks;
 
-    // 加到自有車（先加再 repack）
-    selfT.assignedCargo.insert(selfT.assignedCargo.end(), pack.begin(), pack.end());
+    const auto originalCargo = selfT.assignedCargo;
+    const int n = (int)originalCargo.size();
 
-    // repack 自有車
-    if (!repackTruck(selfT, cargoLookup, /*maxTriesInsert=*/80)) {
-        // rollback
-        selfT.assignedCargo = std::move(backupSelf);
-        ind.rentedTrucks    = std::move(backupRented);
-        return false;
+    // 嘗試不同插入位置，而不是只 append 到尾端
+    for (int pos = 0; pos <= n; ++pos) {
+        selfT.assignedCargo = originalCargo;
+
+        selfT.assignedCargo.insert(
+            selfT.assignedCargo.begin() + pos,
+            pack.begin(),
+            pack.end()
+        );
+
+        if (repackTruck(selfT, cargoLookup, /*maxTriesInsert=*/80)) {
+            removeCustomerFromRented(ind, cid);
+            return true;
+        }
     }
 
-    // 成功：從 rented 移除 cid
-    removeCustomerFromRented(ind, cid);
-
-    return true;
+    // 全部插入位置都失敗才 rollback
+    selfT.assignedCargo = std::move(backupSelf);
+    ind.rentedTrucks = std::move(backupRented);
+    return false;
 }
 
 static vector<Gene> collectCustomerGenesFromSelf(const Truck& t, int cid) {
@@ -152,28 +211,6 @@ static bool doReinsertionOnce(
     return false;
 }
 
-static bool doConsolidationOnce(
-    Individual& ind,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup
-){
-    for (int i = 0; i < (int)ind.rentedTrucks.size(); ++i) {
-        for (int j = i + 1; j < (int)ind.rentedTrucks.size(); ++j) {
-            auto backup = ind.rentedTrucks;
-
-            auto& A = ind.rentedTrucks[i];
-            auto& B = ind.rentedTrucks[j];
-            A.assignedCargo.insert(A.assignedCargo.end(), B.assignedCargo.begin(), B.assignedCargo.end());
-
-            if (repackTruck(A, cargoLookup, 100)) {
-                ind.rentedTrucks.erase(ind.rentedTrucks.begin() + j);
-                return true;
-            } else {
-                ind.rentedTrucks = std::move(backup);
-            }
-        }
-    }
-    return false;
-}
 
 static bool doExchangeOnce(
     Individual& ind,
@@ -181,116 +218,88 @@ static bool doExchangeOnce(
     const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup
 ){
     // 1) 找 rented 客戶集合
-    unordered_set<int> omega;
+    unordered_set<int> omegaSet;
     for (const auto& rt : ind.rentedTrucks)
         for (const auto& g : rt.assignedCargo)
-            omega.insert(g.customerId);
-    if (omega.empty()) return false;
+            omegaSet.insert(g.customerId);
 
-    // 2) 找一個 rented 客戶（你也可以改成隨機）
-    int cidR = *omega.begin();
-    vector<Gene> packR = collectCustomerGenesFromRented(ind, cidR);
-    if (packR.empty()) return false;
+    if (omegaSet.empty()) return false;
 
-    // 3) 找一台自有車 + 一個 self 客戶 cidS
-    for (int area = 1; area <= regionNum; ++area) {
-        Truck& selfT = ind.selfOwnedTrucks[area];
+    vector<int> omega(omegaSet.begin(), omegaSet.end());
 
-        // selfT 裡有哪些客戶
-        unordered_set<int> selfCustomers;
-        for (auto& g : selfT.assignedCargo) selfCustomers.insert(g.customerId);
-        if (selfCustomers.empty()) continue;
+    // 👉 關鍵改動：全部試，不只第一個
+    for (int cidR : omega) {
 
-        for (int cidS : selfCustomers) {
-            // cidR 必須允許放到 area（服務限制）
-            if (parameters.serviceRegion[cidR - 1][area - 1] != 1) continue;
+        vector<Gene> packR = collectCustomerGenesFromRented(ind, cidR);
+        if (packR.empty()) continue;
 
-            // ===== 交換開始：先備份 =====
-            Individual backup = ind;
+        // 2) 找 self truck + cidS
+        for (int area = 1; area <= regionNum; ++area) {
+            Truck& selfT = ind.selfOwnedTrucks[area];
 
-            // packS
-            vector<Gene> packS = collectCustomerGenesFromSelf(selfT, cidS);
-            if (packS.empty()) { ind = std::move(backup); continue; }
+            unordered_set<int> selfCustomers;
+            for (auto& g : selfT.assignedCargo)
+                selfCustomers.insert(g.customerId);
 
-            // (a) self 車移除 cidS，加入 cidR
-            removeCustomerFromSelf(selfT, cidS);
-            selfT.assignedCargo.insert(selfT.assignedCargo.end(), packR.begin(), packR.end());
+            if (selfCustomers.empty()) continue;
 
-            // (b) rented 移除 cidR，加入 cidS（丟回 rented：先丟到「第一台有 cidR 的 rented truck」）
-            // 你也可以更聰明：找原本裝 cidR 的那台 rented truck
-            removeCustomerFromRented(ind, cidR);
-            if (ind.rentedTrucks.empty()) {
-                // 沒有 rented truck 就代表 cidR 被移掉了，但我們還要把 cidS 丟去哪？=> rollback
-                ind = std::move(backup);
-                continue;
-            }
-            ind.rentedTrucks[0].assignedCargo.insert(ind.rentedTrucks[0].assignedCargo.end(), packS.begin(), packS.end());
+            for (int cidS : selfCustomers) {
 
-            // (c) repack 兩台車（self + rented[0]）
-            bool ok1 = repackTruck(ind.selfOwnedTrucks[area], cargoLookup, 80);
-            bool ok2 = repackTruck(ind.rentedTrucks[0], cargoLookup, 100);
+                if (parameters.serviceRegion[cidR - 1][area - 1] != 1) continue;
 
-            if (ok1 && ok2) {
-                // 成功一次 exchange
-                return true;
-            } else {
-                ind = std::move(backup);
+                Individual backup = ind;
+
+                vector<Gene> packS = collectCustomerGenesFromSelf(selfT, cidS);
+                if (packS.empty()) { ind = std::move(backup); continue; }
+
+                // self: 移除 S，加入 R
+                removeCustomerFromSelf(selfT, cidS);
+                selfT.assignedCargo.insert(
+                    selfT.assignedCargo.end(),
+                    packR.begin(),
+                    packR.end()
+                );
+
+                // rented: 移除 R
+                removeCustomerFromRented(ind, cidR);
+
+                // 👉 嘗試放到不同 rented truck
+                bool success = false;
+
+                for (int rtIdx = 0; rtIdx < (int)ind.rentedTrucks.size(); ++rtIdx) {
+                    ind.rentedTrucks[rtIdx].assignedCargo.insert(
+                        ind.rentedTrucks[rtIdx].assignedCargo.end(),
+                        packS.begin(),
+                        packS.end()
+                    );
+
+                    bool ok1 = repackTruck(ind.selfOwnedTrucks[area], cargoLookup, 80);
+                    bool ok2 = repackTruck(ind.rentedTrucks[rtIdx], cargoLookup, 100);
+
+                    if (ok1 && ok2) {
+                        success = true;
+                        break;
+                    }
+
+                    // rollback 該台 rented truck
+                    ind = backup;
+                }
+
+                if (success) {
+                    return true;
+                } else {
+                    ind = std::move(backup);
+                }
             }
         }
     }
     return false;
 }
-
 static int rentedTruckCount(const Individual& ind) {
     return (int)ind.rentedTrucks.size();
 }
 
-static void localSearchReduceRentedBudget(
-    Individual& ind,
-    const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    int budgetMoves = 1800   // 老師說的總次數（例如 90）
-){
-    static std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<int> pickOp(0, 2); // 0..2 => 1/3 each
 
-    // 你可以用「租用車數」當主要改善判斷（老師要看 Obj1）
-    int bestRentedCnt = rentedTruckCount(ind);
-
-    for (int iter = 0; iter < budgetMoves; ++iter) {
-        int op = pickOp(rng);
-
-        // 備份：失敗就 rollback
-        Individual backup = ind;
-
-        bool moved = false;
-
-        if (op == opReinsertion) {
-            // 你原本 LS-A 的內容：tryMoveRentedCustomerToSelfTruck(...)
-            moved = doReinsertionOnce(ind, parameters, cargoLookup);   // 你等下照我第3段做
-        } 
-        else if (op == opConsolidation) {
-            // 你原本 LS-B：merge rented trucks
-            moved = doConsolidationOnce(ind, cargoLookup);            // 你等下照我第3段做
-        } 
-        else if (op == opExchange) {
-            // 新增：交換 rented 客戶 與 self 客戶
-            moved = doExchangeOnce(ind, parameters, cargoLookup);     // 你等下照我第4段做
-        }
-
-        // 接受準則：租用車數下降才算改善（最直觀、也符合老師主軸）
-        int nowCnt = rentedTruckCount(ind);
-        if (moved && nowCnt <= bestRentedCnt) {
-            bestRentedCnt = nowCnt;
-            break;
-        } else {
-            ind = std::move(backup); // rollback
-        }
-
-        // 已經 0 台租用車就提前停
-        if (bestRentedCnt == 0) break;
-    }
-}
 struct SeedCustomer { int area; int omega; };
 
 struct SeedCargo {
@@ -612,228 +621,219 @@ static bool localSearchRotateAllAndTryInsert(
     return false;
 }
 
-void evaluateFitness(Individual &indiv, const Data &parameters) {
-    indiv.fitness.clear();
-    long long vechicleLoadedMaxGap = 0;
-    long long rentedVehicleCargoCost = 0;
 
-    Truck selfOwnedTrucks[regionNum + 1]; // 每一區域皆有自己的自有車輛
-    vector<Truck> rentedTrucks;
+void evaluateFitness(Individual& indiv,
+                     const Data& parameters,
+                     LoadingCache& loadingCache) {
+
+    const double C1 = 5.41;
+
+    double outsourcedCost = 0.0;
+    double selfOwnedFuelCost = 0.0;
+
+    Truck selfOwnedTrucks[regionNum + 1];
     unordered_map<int, vector<Gene>> regionMap;
-    unordered_map<int, bool> isLoadedGlobal; // 紀錄所有裝過的客戶
-    vector<int> notLoadedCustomer;           // 紀錄裝不了的客戶
-    
-    for (int i = 1; i <= regionNum; ++i) { 
-        selfOwnedTrucks[i].truckId = i;
-    }
+    unordered_map<int, bool> isLoadedGlobal;
 
-    // 先把染色體中出現過的所有客戶初始化為 false（預設都沒裝到）
-    for (const auto &gene : indiv.chromosome) {
-        isLoadedGlobal[gene.customerId] = false;
-        regionMap[gene.decodedServiceArea].push_back(gene);  // 順便建 regionMap
-    }
+    auto cargoLookup = createCargoLookup(parameters);
 
+    long long dbgHit = 0;
+    long long dbgReal = 0;
+
+    // ==============================
+    // init
+    // ==============================
     for (int area = 1; area <= regionNum; ++area) {
-        if (regionMap.find(area) == regionMap.end()) continue;
-        vector<Gene> &cargoList = regionMap[area];
+        selfOwnedTrucks[area] = Truck();
+        selfOwnedTrucks[area].truckId = area;
+    }
 
-        // 按染色體順序處理（從後往前）
+    // ==============================
+    // build regionMap
+    // ==============================
+    for (const auto& g : indiv.chromosome) {
+        regionMap[g.decodedServiceArea].push_back(g);
+        isLoadedGlobal[g.customerId] = false;
+    }
+
+    // ==============================
+    // self-owned loading
+    // ==============================
+    for (int area = 1; area <= regionNum; ++area) {
+
+        auto it = regionMap.find(area);
+        if (it == regionMap.end()) continue;
+
+        auto& cargoList = it->second;
+
         unordered_map<int, vector<Gene>> customerGrouped;
-        for (int i = (int)cargoList.size() - 1; i >= 0; --i) {
-            const Gene& g = cargoList[i];
+        for (auto& g : cargoList) {
             customerGrouped[g.customerId].push_back(g);
         }
 
-        // === 自有車輛處理===
+        vector<int> customerSet;
+        customerSet.reserve(customerGrouped.size());
+        for (auto& kv : customerGrouped) {
+            customerSet.push_back(kv.first);
+        }
+
+        sort(customerSet.begin(), customerSet.end());
+        customerSet.erase(unique(customerSet.begin(), customerSet.end()), customerSet.end());
+
+        string key = buildSortedCustomerKey(customerSet);
+
+        // exact cache hit: 整組都成功過
+        if (loadingCache.selfOwnedSuccessCache[area].count(key)) {
+            dbgHit++;
+
+            for (int cid : customerSet) {
+                isLoadedGlobal[cid] = true;
+                selfOwnedTrucks[area].loadedVolume += parameters.totalVolume[cid - 1];
+            }
+
+            selfOwnedTrucks[area].route =
+                buildRouteFromFixedOrder(customerSet, parameters, area);
+
+            continue;
+        }
+
+        dbgReal++;
+
         Truck& truck = selfOwnedTrucks[area];
-        unordered_set<int> seen;
-        
         BLPlacement3D loader(truck.length, truck.width, truck.height);
-        loader.setCargoLookup(createCargoLookup(parameters));
+        loader.setCargoLookup(cargoLookup);
 
-        for (const auto& gene : cargoList) {
-            if (seen.count(gene.customerId)) continue;
-            seen.insert(gene.customerId);
+        bool allSuccess = true;
+        vector<int> loadedCustomers;
 
-            auto& cargoGroup = customerGrouped[gene.customerId];
-            if (loader.tryInsert(cargoGroup,50)) {
-                truck.loadedVolume += parameters.totalVolume[gene.customerId - 1];
-                truck.assignedCargo.insert(truck.assignedCargo.end(), cargoGroup.begin(), cargoGroup.end());
-                isLoadedGlobal[gene.customerId] = true;
+        // 逐 customer 試，fail 不 break
+        for (int custId : customerSet) {
 
-                for (const auto& g : cargoGroup) {
-                    for (auto& indivGene : indiv.chromosome) {
-                        if (indivGene.customerId == g.customerId && indivGene.cargoId == g.cargoId) {
-                            indivGene.position[0] = g.position[0];
-                            indivGene.position[1] = g.position[1];
-                            indivGene.position[2] = g.position[2];
-                        }
-                    }
+            auto cargoGroup = customerGrouped[custId];
+            bool success = false;
+
+            for (int trial = 0; trial < 5 && !success; ++trial) {
+                auto temp = cargoGroup;
+
+                if (trial > 0) {
+                    static thread_local std::mt19937 rng(std::random_device{}());
+                    shuffle(temp.begin(), temp.end(), rng);
                 }
+
+                if (loader.tryInsert(temp, 50)) {
+                    success = true;
+                }
+            }
+
+            if (success) {
+                loadedCustomers.push_back(custId);
+                isLoadedGlobal[custId] = true;
+                truck.loadedVolume += parameters.totalVolume[custId - 1];
             } else {
-                // 這個顧客裝不下 → 保持 false，後面交給租用車
-                continue;
-            }
-        }
-    }
-
-    long long maxVol = 0;
-    long long minVol = INT_MAX;
-    for (int area = 1; area <= regionNum; ++area) {
-        long long v = selfOwnedTrucks[area].loadedVolume;
-        if (v > maxVol) maxVol = v;
-        if (v < minVol) minVol = v;
-    }
-    vechicleLoadedMaxGap = maxVol - minVol;
-    indiv.fitness.push_back(vechicleLoadedMaxGap);
-
-    // ✅ 這裡一定會包含所有「出現在 chromosome 中」但沒被自有車載到的客戶
-    notLoadedCustomer.clear();
-    for (const auto& [customerId, loaded] : isLoadedGlobal) {
-        if (!loaded) {
-            notLoadedCustomer.push_back(customerId);
-        }
-    }
-    sort(notLoadedCustomer.begin(), notLoadedCustomer.end());
-    
-    size_t cursor = 0;
-    int rentedTruckId = 0;
-    unordered_set<int> rentedSeen;
-
-    unordered_set<int> notLoadedSet(notLoadedCustomer.begin(), notLoadedCustomer.end());
-    
-    // 以「顧客」為單位，把沒裝到的客戶分批塞進租用車
-    while (cursor < notLoadedCustomer.size()) {
-
-        Truck rentedTruck;
-        rentedTruck.truckId = ++rentedTruckId;
-
-        BLPlacement3D loader(rentedTruck.length, rentedTruck.width, rentedTruck.height);
-        loader.setCargoLookup(createCargoLookup(parameters));
-
-        bool anyLoadedThisTruck = false;
-
-        for (; cursor < notLoadedCustomer.size(); ++cursor) {
-            int custId = notLoadedCustomer[cursor];
-
-            if (rentedSeen.count(custId)) continue;
-            
-            // 建 cargoGroup
-            vector<Gene> cargoGroup;
-            for (const auto& g : indiv.chromosome) {
-                if (g.customerId == custId) {
-                    cargoGroup.push_back(g);
-                }
-            }
-            if (cargoGroup.empty()) continue;
-
-            bool canLoad = loader.tryInsert(cargoGroup,50);
-            //試錯
-            if (!canLoad) {
-                long long bestOverflow = 0;
-                // ★ 老師要的：cannot be loaded -> 整包換方向做 local search
-                canLoad = localSearchRotateAllAndTryInsert(
-                loader,
-                cargoGroup,
-                loader.cargoLookup,
-                /*maxOuterTries=*/20,
-                /*maxInsertTries=*/30,
-                bestOverflow
-            );
-
-    // 你可以順便印 overflow 讓你知道是不是「體積真的爆了」
-    /*if (!canLoad) {
-        cerr << "[LS FAIL] cust " << custId
-             << " bestOverflowVolume=" << bestOverflow << "\n";
-    }*/
-}
-            if (canLoad) {
-                anyLoadedThisTruck = true;
-                rentedSeen.insert(custId);
-
-                rentedTruck.assignedCargo.insert(rentedTruck.assignedCargo.end(),
-                                                cargoGroup.begin(), cargoGroup.end());
-                rentedTruck.route.push_back(custId);
-
-                for (const auto& g : cargoGroup) {
-                    const Cargo& c = loader.cargoLookup[g.customerId][g.cargoId];
-                    int chargeUnits = c.volume;
-                    rentedVehicleCargoCost += chargeUnits * 6;
-                }
-            } else {
-                // 分兩種狀況：
-                if (!anyLoadedThisTruck) {    
-                    rentedSeen.insert(custId);
-                    cerr << "Customer " << custId << " cannot be loaded into any rented truck.\n";
-                    continue; 
-                } else {
-                    break;
-                }
+                allSuccess = false;
             }
         }
 
-        if (anyLoadedThisTruck) {
-            rentedTrucks.push_back(rentedTruck);
+        sort(loadedCustomers.begin(), loadedCustomers.end());
+        loadedCustomers.erase(unique(loadedCustomers.begin(), loadedCustomers.end()), loadedCustomers.end());
+
+        if (!loadedCustomers.empty()) {
+            truck.route = buildRouteFromFixedOrder(loadedCustomers, parameters, area);
         } else {
-            break;
+            truck.route.clear();
+        }
+
+        // 只有整組都成功才 cache
+        if (allSuccess) {
+            loadingCache.selfOwnedSuccessCache[area].insert(key);
         }
     }
 
-    for (int i = 1; i <= regionNum; ++i) {
-        indiv.selfOwnedTrucks[i] = selfOwnedTrucks[i];
+    // ==============================
+    // collect not loaded
+    // ==============================
+    vector<int> notLoaded;
+    for (auto& kv : isLoadedGlobal) {
+        if (!kv.second) notLoaded.push_back(kv.first);
     }
-    indiv.rentedTrucks = rentedTrucks;
-    indiv.fitness.push_back(rentedVehicleCargoCost);
-    indiv.rentedVehicleLoadingCost = (double)rentedVehicleCargoCost;
 
+    // ==============================
+    // self-owned fuel cost
+    // ==============================
+    for (int area = 1; area <= regionNum; ++area) {
+        auto& route = selfOwnedTrucks[area].route;
+        if (route.empty()) continue;
+
+        double dist = 0.0;
+        dist += parameters.getDistance(0, route.front());
+        for (int i = 0; i + 1 < (int)route.size(); ++i) {
+            dist += parameters.getDistance(route[i], route[i + 1]);
+        }
+        dist += parameters.getDistance(route.back(), 0);
+
+        selfOwnedFuelCost += dist;
+    }
+
+    // ==============================
+    // rented cost
+    // ==============================
+    for (int cid : notLoaded) {
+        double vol = parameters.totalVolume[cid - 1];
+        int v = (int)ceil(vol);
+        outsourcedCost += 100 + 30 * max(0, v - 3);
+    }
+
+    // ==============================
+    // final
+    // ==============================
+    for (int area = 1; area <= regionNum; ++area) {
+        indiv.selfOwnedTrucks[area] = selfOwnedTrucks[area];
+    }
+
+    double obj = outsourcedCost + C1 * selfOwnedFuelCost;
+    indiv.fitness.clear();
+    indiv.fitness.push_back(obj);
+
+    cout << "[FAST] hit=" << dbgHit << " real=" << dbgReal << endl;
 }
+vector<Individual> selection(const vector<Individual>& population,
+                             const vector<Individual>& decodedPopulation,
+                             double eliteRatio = 0.05,
+                             int tournamentSize = 2) {
 
-
-
-vector<Individual> selection(const vector<Individual>& population, const vector<Individual>& decodedPopulation, double eliteRatio = 0.05, int tournamentSize = 2) {
-    
     int eliteCount = static_cast<int>(population.size() * eliteRatio);
     vector<int> indices(population.size());
-    iota(indices.begin(), indices.end(), 0); // [0, 1, 2, ..., N-1]
+    iota(indices.begin(), indices.end(), 0);
 
-    // 依照 fitness 排序 index
-    // 這個 fitness 就是最後目標函數值，因為long long太大如果換成小數可能出現錯誤，所以要把fitness越小的擺在最前面
+    // 依照單一目標 fitness[0]（總成本）排序：越小越好
     sort(indices.begin(), indices.end(), [&](int a, int b) {
         const auto& fa = decodedPopulation[a].fitness;
         const auto& fb = decodedPopulation[b].fitness;
-
-        // 先比第二個目標：fitness[1](外用租用成本)
-        if (fa[1] != fb[1]) {
-            return fa[1] < fb[1];   // 越小排越前面
-        }
-        // 若 fitness[1] 一樣，再比第一個目標：fitness[0](各車裝載材積差距)
-        return fa[0] < fb[0];       // 也是越小排越前面
+        return fa[0] < fb[0];
     });
 
-    // 1. 先選出 top N% elite
+    // 1) Elite
     vector<Individual> newPopulation;
+    newPopulation.reserve(population.size());
+
     for (int i = 0; i < eliteCount; ++i) {
         newPopulation.push_back(population[indices[i]]);
     }
 
-    // 2. Tournament selection 直到補滿
+    // 2) Tournament selection 補滿
     while (newPopulation.size() < population.size()) {
-        // 隨機抽出 tournamentSize 個 index
         vector<int> tournament;
+        tournament.reserve(tournamentSize);
+
         for (int i = 0; i < tournamentSize; ++i) {
             int r = rand() % population.size();
             tournament.push_back(r);
         }
 
-        // 找出 tournament 中 fitness 最好的
-        int bestIdx = *min_element(tournament.begin(), tournament.end(), [&](int a, int b) {
+        int bestIdx = *min_element(tournament.begin(), tournament.end(),
+                                   [&](int a, int b) {
             const auto& fa = decodedPopulation[a].fitness;
             const auto& fb = decodedPopulation[b].fitness;
-            // 先看 fitness[1]，小的視為「比較小」
-            if (fa[1] != fb[1]) {
-                return fa[1] < fb[1];  // fa[1] 比 fb[1] 小 >> a 比 b 小
-            }
-            // 若 fitness[1] 相同，再比 fitness[0]
             return fa[0] < fb[0];
         });
 
@@ -842,7 +842,6 @@ vector<Individual> selection(const vector<Individual>& population, const vector<
 
     return newPopulation;
 }
-
 void crossoverServiceArea(Individual& child1, Individual& child2, double swapProb = 0.5) {
     assert(child1.chromosome.size() == child2.chromosome.size());
     size_t n = child1.chromosome.size();
@@ -994,588 +993,787 @@ void mutateRotation(Individual& indiv, double mutationRate) {
         }
     }
 }
-// ===================== 你已有/你之前用過的 helper（若已存在可略過） =====================
-
-static bool evalCandidate_NoWorseObj1(
-    Individual& ind,
-    const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    long long baselineF1
-){
-    vector<Individual> tmp{ ind };
-    decodePopulation(tmp, parameters, cargoLookup);
-    ind = tmp[0];
-
-    ind.fitness.clear();
-    evaluateFitness(ind, parameters);
-
-    if (ind.fitness.size() < 2) return false;
-
-    // Obj1 不變差（允許變更好）
-    if (ind.fitness[1] > baselineF1) return false;
-
-    return true;
+static bool isBetter(const Individual& a, const Individual& b) {
+    return a.fitness[0] < b.fitness[0];
 }
+static vector<int> getCustomerOrderFromChromosome(const Individual& ind)
+{
+    vector<int> order;
+    unordered_set<int> seen;
+    order.reserve(ind.chromosome.size());
 
-
-static inline bool canServe(const Data& parameters, int customerId, int area) {
-    return parameters.serviceRegion[customerId - 1][area - 1] == 1;
-}
-
-static unordered_set<int> collectOmegaRentedCustomers(const Individual& ind) {
-    unordered_set<int> omega;
-    for (const auto& rt : ind.rentedTrucks)
-        for (const auto& g : rt.assignedCargo)
-            omega.insert(g.customerId);
-    return omega;
-}
-
-// 每客戶一次，排除Ω
-static void buildCustomerAreaMap_SelfOnly(
-    const Individual& ind,
-    const unordered_set<int>& omega,
-    unordered_map<int,int>& custArea,
-    vector<vector<int>>& customersInArea
-){
-    custArea.clear();
-    customersInArea.assign(regionNum + 1, {});
     for (const auto& g : ind.chromosome) {
-        int cid = g.customerId;
-        if (omega.count(cid)) continue;
-        if (custArea.find(cid) != custArea.end()) continue;
-        int a = g.routeArea;
-        if (a < 1 || a > regionNum) continue;
-        custArea[cid] = a;
-        customersInArea[a].push_back(cid);
-    }
-}
-
-static void applyMoveCustomerArea(Individual& ind, int cid, int newArea) {
-    for (auto& g : ind.chromosome)
-        if (g.customerId == cid)
-            g.routeArea = newArea;
-}
-
-static void applySwapCustomersArea(Individual& ind, int cidA, int areaA, int cidB, int areaB) {
-    for (auto& g : ind.chromosome) {
-        if (g.customerId == cidA) g.routeArea = areaB;
-        else if (g.customerId == cidB) g.routeArea = areaA;
-    }
-}
-
-// ===================== Teacher-style Obj2 比較（字典序） =====================
-struct Obj2State {
-    long long maxLoad;
-    long long minLoad;
-    long long gap() const { return maxLoad - minLoad; }
-};
-
-static Obj2State getObj2State(const Individual& ind) {
-    long long mx = 0;
-    long long mn = LLONG_MAX;
-    for (int a = 1; a <= regionNum; ++a) {
-        mx = max(mx, ind.selfOwnedTrucks[a].loadedVolume);
-        mn = min(mn, ind.selfOwnedTrucks[a].loadedVolume);
-    }
-    return {mx, mn};
-}
-
-static bool betterObj2Lex(const Obj2State& cur, const Obj2State& base) {
-    if (cur.maxLoad != base.maxLoad) return cur.maxLoad < base.maxLoad;
-    if (cur.minLoad != base.minLoad) return cur.minLoad > base.minLoad;
-    return cur.gap() < base.gap();
-}
-
-
-static bool equalObj2(const Obj2State& a, const Obj2State& b) {
-    return a.maxLoad == b.maxLoad && a.minLoad == b.minLoad && a.gap() == b.gap();
-}
-
-// cur 不比 base 差（允許平手 / 或在 lex 序上不後退）
-static bool notWorseObj2Lex(const Obj2State& cur, const Obj2State& base) {
-    // 只要 base 不比 cur 好，就代表 cur >= base（lex）
-    return !betterObj2Lex(base, cur);
-}
-// maxLoad 越小越好；同 maxLoad 時 minLoad 越大越好；再同看 gap
-
-
-
-
-// ===================== OSR 候選：serviceRegion 交集 + 相鄰區域 =====================
-// 從 areaFrom 移到 areaTo 的 OSR 客戶：目前在 areaFrom，且同時可由 areaTo 服務（也可由 areaFrom 服務通常成立）
-static vector<int> getOSRCustomers_FromTo(
-    const vector<vector<int>>& customersInArea,
-    const Data& parameters,
-    const unordered_set<int>& omega,
-    int areaFrom, int areaTo
-){
-    vector<int> res;
-    for (int cid : customersInArea[areaFrom]) {
-        if (omega.count(cid)) continue;
-        if (canServe(parameters, cid, areaFrom) && canServe(parameters, cid, areaTo)) {
-            res.push_back(cid);
+        if (!seen.count(g.customerId)) {
+            seen.insert(g.customerId);
+            order.push_back(g.customerId);
         }
     }
-    return res;
+    return order;
 }
+static void swapCustomerBlocksInChromosome(Individual& ind, int c1, int c2)
+{
+    if (c1 == c2) return;
 
-// 用 totalVolume 當作啟發式排序（大件優先）
-static void sortByVolumeDesc(vector<int>& cands, const Data& parameters) {
-    sort(cands.begin(), cands.end(), [&](int x, int y){
-        return parameters.totalVolume[x - 1] > parameters.totalVolume[y - 1];
-    });
-}
+    vector<Gene> block1, block2;
+    vector<Gene> newChrom;
+    newChrom.reserve(ind.chromosome.size());
 
-// ===================== 核心：對指定 area 嘗試 Reduce-Max（先 insertion 再 exchange） =====================
-static bool decodeEvalKeepObj1Baseline_BestOfN(
-    Individual& ind,
-    const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    long long obj1Baseline,
-    int N
-){
-    Individual best = ind;
-    bool hasBest = false;
-
-    long long bestF1 = LLONG_MAX;
-    Obj2State bestObj2{LLONG_MAX, 0};
-
-    for (int t = 0; t < N; ++t) {
-        Individual cand = ind;
-
-        vector<Individual> tmp{ cand };
-        decodePopulation(tmp, parameters, cargoLookup);
-        cand = tmp[0];
-
-        cand.fitness.clear();
-        evaluateFitness(cand, parameters);
-
-        if (cand.fitness.size() < 2) continue;
-        if (cand.fitness[1] > obj1Baseline) continue;  // Obj1 不變差
-
-        Obj2State st = getObj2State(cand);
-
-        // 先比 Obj1，再比 Obj2Lex（你也可以只挑 Obj2 最好）
-        if (!hasBest ||
-            cand.fitness[1] < bestF1 ||
-            (cand.fitness[1] == bestF1 && betterObj2Lex(st, bestObj2)))
-        {
-            hasBest = true;
-            best = cand;
-            bestF1 = cand.fitness[1];
-            bestObj2 = st;
-        }
+    for (const auto& g : ind.chromosome) {
+        if (g.customerId == c1) block1.push_back(g);
+        else if (g.customerId == c2) block2.push_back(g);
     }
 
-    if (!hasBest) return false;
+    bool inserted = false;
+    for (size_t i = 0; i < ind.chromosome.size(); ++i) {
+        int cid = ind.chromosome[i].customerId;
 
-    ind = best;
-    return true;
-}
-
-
-static bool tryReduceMaxOnArea_KeepObj1Baseline(
-    Individual& ind,
-    const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    long long obj1Baseline,
-    int areaA,
-    int repackRestarts
-){
-    Obj2State base = getObj2State(ind);
-
-    vector<int> neighbors;
-    if (areaA - 1 >= 1) neighbors.push_back(areaA - 1);
-    if (areaA + 1 <= regionNum) neighbors.push_back(areaA + 1);
-
-    // 這裡 omegaBaseline 已移除：改成 self-only map（你原本的 build 需要 omega，我用空集合表示「沒有人禁止動」，
-    // 但真正禁止動的是「不能讓 Obj1 變大」，由 obj1Baseline 保護。
-    unordered_set<int> omegaEmpty;
-    unordered_map<int,int> custArea;
-    vector<vector<int>> customersInArea;
-    buildCustomerAreaMap_SelfOnly(ind, omegaEmpty, custArea, customersInArea);
-
-    // A1) Insertion
-    for (int areaB : neighbors) {
-        auto Sa = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
-        if (Sa.empty()) continue;
-        sortByVolumeDesc(Sa, parameters);
-
-        for (int cid : Sa) {
-            Individual backup = ind;
-
-            for (int r = 0; r < repackRestarts; ++r) {
-                ind = backup;
-                applyMoveCustomerArea(ind, cid, areaB);
-
-                if (!decodeEvalKeepObj1Baseline_BestOfN(ind, parameters, cargoLookup, obj1Baseline, /*N=*/10)
-) {
-                    continue;
-                }
-
-                Obj2State cur = getObj2State(ind);
-                if (betterObj2Lex(cur, base)) return true;
-            }
-            ind = backup;
-        }
-    }
-
-    // A2) Pair-exchange
-    for (int areaB : neighbors) {
-        auto Sa = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
-        auto Sb = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
-        if (Sa.empty() || Sb.empty()) continue;
-
-        struct Cand { int i, j; long long improveA; };
-        vector<Cand> cands;
-        long long loadA = ind.selfOwnedTrucks[areaA].loadedVolume;
-
-        for (int i : Sa) {
-            long long vi = parameters.totalVolume[i - 1];
-            for (int j : Sb) {
-                long long vj = parameters.totalVolume[j - 1];
-                long long newA = loadA - vi + vj;
-                long long improve = loadA - newA;
-                if (improve > 0) cands.push_back({i, j, improve});
-            }
-        }
-        if (cands.empty()) continue;
-
-        sort(cands.begin(), cands.end(), [&](const Cand& x, const Cand& y){
-            return x.improveA > y.improveA;
-        });
-
-        for (const auto& pc : cands) {
-            Individual backup = ind;
-
-            for (int r = 0; r < repackRestarts; ++r) {
-                ind = backup;
-                applySwapCustomersArea(ind, pc.i, areaA, pc.j, areaB);
-
-                if (!decodeEvalKeepObj1Baseline_BestOfN(ind, parameters, cargoLookup, obj1Baseline, /*N=*/10)
-) {
-                    continue;
-                }
-
-                Obj2State cur = getObj2State(ind);
-                if (betterObj2Lex(cur, base)) return true;
-            }
-            ind = backup;
-        }
-    }
-
-    return false;
-}
-
-static bool tryIncreaseMinOnArea_KeepObj1Baseline(
-    Individual& ind,
-    const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    long long obj1Baseline,
-    int areaA,
-    int repackRestarts
-){
-    Obj2State base = getObj2State(ind);
-
-    vector<int> neighbors;
-    if (areaA - 1 >= 1) neighbors.push_back(areaA - 1);
-    if (areaA + 1 <= regionNum) neighbors.push_back(areaA + 1);
-
-    unordered_set<int> omegaEmpty;
-    unordered_map<int,int> custArea;
-    vector<vector<int>> customersInArea;
-    buildCustomerAreaMap_SelfOnly(ind, omegaEmpty, custArea, customersInArea);
-
-    // B1) Insertion
-    for (int areaB : neighbors) {
-        auto Sb_to_A = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
-        if (Sb_to_A.empty()) continue;
-        sortByVolumeDesc(Sb_to_A, parameters);
-
-        for (int cid : Sb_to_A) {
-            Individual backup = ind;
-
-            for (int r = 0; r < repackRestarts; ++r) {
-                ind = backup;
-                applyMoveCustomerArea(ind, cid, areaA);
-
-                if (!decodeEvalKeepObj1Baseline_BestOfN(ind, parameters, cargoLookup, obj1Baseline, /*N=*/10)
-) {
-                    continue;
-                }
-
-                Obj2State cur = getObj2State(ind);
-                if (betterObj2Lex(cur, base)) return true;
-            }
-            ind = backup;
-        }
-    }
-
-    // B2) Pair-exchange
-    for (int areaB : neighbors) {
-        auto A_to_B = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
-        auto B_to_A = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
-        if (A_to_B.empty() || B_to_A.empty()) continue;
-
-        struct Cand { int iFromB, jFromA; long long improveMin; };
-        vector<Cand> cands;
-        long long loadA = ind.selfOwnedTrucks[areaA].loadedVolume;
-
-        for (int i : B_to_A) {
-            long long vi = parameters.totalVolume[i - 1];
-            for (int j : A_to_B) {
-                long long vj = parameters.totalVolume[j - 1];
-                long long newA = loadA + vi - vj;
-                long long improve = newA - loadA;
-                if (improve > 0) cands.push_back({i, j, improve});
-            }
-        }
-        if (cands.empty()) continue;
-
-        sort(cands.begin(), cands.end(), [&](const Cand& x, const Cand& y){
-            return x.improveMin > y.improveMin;
-        });
-
-        for (const auto& pc : cands) {
-            Individual backup = ind;
-
-            for (int r = 0; r < repackRestarts; ++r) {
-                ind = backup;
-                applySwapCustomersArea(ind, pc.iFromB, areaB, pc.jFromA, areaA);
-
-                if (!decodeEvalKeepObj1Baseline_BestOfN(ind, parameters, cargoLookup, obj1Baseline, /*N=*/10)
-) {
-                    continue;
-                }
-
-                Obj2State cur = getObj2State(ind);
-                if (betterObj2Lex(cur, base)) return true;
-            }
-            ind = backup;
-        }
-    }
-
-    return false;
-}
-
-static bool tryTwoStepImproveOnArea_Obj2Lex(
-    Individual& ind,
-    const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    long long baselineF1,
-    int areaA,
-    int repackRestarts,
-    bool isReduceMaxPhase
-){
-    Obj2State base2 = getObj2State(ind);
-
-    // neighbors
-    vector<int> neighbors;
-    if (areaA - 1 >= 1) neighbors.push_back(areaA - 1);
-    if (areaA + 1 <= regionNum) neighbors.push_back(areaA + 1);
-
-    // 用你原本的 OSR 產生法（這裡不排除 omega，靠 Obj1 baseline 擋）
-    unordered_set<int> omegaEmpty;
-    unordered_map<int,int> custArea;
-    vector<vector<int>> customersInArea;
-    buildCustomerAreaMap_SelfOnly(ind, omegaEmpty, custArea, customersInArea);
-
-    struct Move {
-        int type; // 0=move, 1=swap
-        int c1, from1, to1;
-        int c2, from2, to2;
-        long long pri;
-    };
-
-    vector<Move> step1;
-    step1.reserve(2000);
-
-    // --- build step1 moves (move + swap) ---
-    for (int areaB : neighbors) {
-        if (isReduceMaxPhase) {
-            // move: areaA -> areaB
-            auto Sa = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
-            sortByVolumeDesc(Sa, parameters);
-            for (int cid : Sa) {
-                step1.push_back({0, cid, areaA, areaB, -1, -1, -1, parameters.totalVolume[cid - 1]});
+        if (cid == c1 || cid == c2) {
+            if (!inserted) {
+                newChrom.insert(newChrom.end(), block2.begin(), block2.end());
+                newChrom.insert(newChrom.end(), block1.begin(), block1.end());
+                inserted = true;
             }
 
-            // swap: areaA <-> areaB (prioritize reducing load of areaA)
-            auto Sb = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
-            long long loadA = ind.selfOwnedTrucks[areaA].loadedVolume;
-            for (int i : Sa) {
-                long long vi = parameters.totalVolume[i - 1];
-                for (int j : Sb) {
-                    long long vj = parameters.totalVolume[j - 1];
-                    long long improveA = vi - vj; // >0 means reduce A
-                    if (improveA > 0) step1.push_back({1, i, areaA, areaB, j, areaB, areaA, improveA});
-                }
+            while (i + 1 < ind.chromosome.size() &&
+                   (ind.chromosome[i + 1].customerId == c1 ||
+                    ind.chromosome[i + 1].customerId == c2)) {
+                ++i;
             }
         } else {
-            // increase min: move areaB -> areaA
-            auto Sb_to_A = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaB, areaA);
-            sortByVolumeDesc(Sb_to_A, parameters);
-            for (int cid : Sb_to_A) {
-                step1.push_back({0, cid, areaB, areaA, -1, -1, -1, parameters.totalVolume[cid - 1]});
+            newChrom.push_back(ind.chromosome[i]);
+        }
+    }
+
+    if (!newChrom.empty() && newChrom.size() == ind.chromosome.size()) {
+        ind.chromosome = std::move(newChrom);
+    }
+}
+static void moveCustomerBlockInChromosome(Individual& ind, int movingCid, int beforeCid)
+{
+    if (movingCid == beforeCid) return;
+
+    vector<Gene> movingBlock;
+    vector<Gene> rest;
+    rest.reserve(ind.chromosome.size());
+
+    for (const auto& g : ind.chromosome) {
+        if (g.customerId == movingCid) movingBlock.push_back(g);
+        else rest.push_back(g);
+    }
+
+    if (movingBlock.empty()) return;
+
+    vector<Gene> newChrom;
+    newChrom.reserve(ind.chromosome.size());
+
+    bool inserted = false;
+    size_t i = 0;
+    while (i < rest.size()) {
+        int cid = rest[i].customerId;
+
+        if (!inserted && cid == beforeCid) {
+            newChrom.insert(newChrom.end(), movingBlock.begin(), movingBlock.end());
+            inserted = true;
+        }
+
+        newChrom.push_back(rest[i]);
+        ++i;
+    }
+
+    if (!inserted) {
+        newChrom.insert(newChrom.end(), movingBlock.begin(), movingBlock.end());
+    }
+
+    if (newChrom.size() == ind.chromosome.size()) {
+        ind.chromosome = std::move(newChrom);
+    }
+}
+// ==============================
+// Helper 3: 重新解碼並重算 fitness
+// ==============================
+static void reDecodeAndEvaluate(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
+{
+    std::vector<Individual> one{ind};
+    LoadingCache loadingCache;   // ⭐ 放這裡
+    decodePopulation(one, parameters, cargoLookup);
+
+    one[0].fitness.clear();
+    evaluateFitness(one[0], parameters,loadingCache);
+
+    ind = one[0];
+}
+static bool betterObj(const Individual& a, const Individual& b, double eps = 1e-9)
+{
+    return a.fitness[0] < b.fitness[0] - eps;
+}
+static bool doBlockSwapSampled(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    int samplePairs = 8)
+{
+    const double EPS = 1e-9;
+
+    // base 解先確定是最新的
+    Individual base = ind;
+    reDecodeAndEvaluate(base, parameters, cargoLookup);
+
+    vector<int> order = getCustomerOrderFromChromosome(base);
+    int n = (int)order.size();
+    if (n < 2) return false;
+
+    // 先產生要測的 pair，避免在 parallel 區塊裡共用 rng
+    vector<pair<int, int>> sampledPairs;
+    sampledPairs.reserve(samplePairs);
+
+    static std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> pick(0, n - 1);
+
+    for (int s = 0; s < samplePairs; ++s) {
+        int i = pick(rng);
+        int j = pick(rng);
+        if (i == j) {
+            --s;
+            continue;
+        }
+        sampledPairs.push_back({i, j});
+    }
+
+    // 每個 sample 一個結果槽
+    vector<Individual> candidates(samplePairs);
+    vector<double> objs(samplePairs, 1e18);
+    vector<char> valid(samplePairs, 0);
+
+#pragma omp parallel for schedule(dynamic)
+    for (int s = 0; s < samplePairs; ++s) {
+        int i = sampledPairs[s].first;
+        int j = sampledPairs[s].second;
+
+        Individual cand = ind;  // thread-local copy
+        swapCustomerBlocksInChromosome(cand, order[i], order[j]);
+        reDecodeAndEvaluate(cand, parameters, cargoLookup);
+
+        if (!cand.fitness.empty()) {
+            candidates[s] = std::move(cand);
+            objs[s] = candidates[s].fitness[0];
+            valid[s] = 1;
+        }
+    }
+
+    // 單執行緒選 best
+    int bestIdx = -1;
+    double bestObj = base.fitness[0];
+
+    for (int s = 0; s < samplePairs; ++s) {
+        if (valid[s] && objs[s] < bestObj - EPS) {
+            bestObj = objs[s];
+            bestIdx = s;
+        }
+    }
+
+    if (bestIdx != -1) {
+        ind = std::move(candidates[bestIdx]);
+        return true;
+    }
+
+    return false;
+}
+static bool doBlockInsertSampled(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    int sampleMoves = 10)
+{
+    const double EPS = 1e-9;
+
+    Individual base = ind;
+    reDecodeAndEvaluate(base, parameters, cargoLookup);
+
+    vector<int> order = getCustomerOrderFromChromosome(base);
+    int n = (int)order.size();
+    if (n < 2) return false;
+
+    vector<pair<int, int>> sampledMoves;
+    sampledMoves.reserve(sampleMoves);
+
+    static std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> pick(0, n - 1);
+
+    for (int s = 0; s < sampleMoves; ++s) {
+        int i = pick(rng);
+        int j = pick(rng);
+        if (i == j) {
+            --s;
+            continue;
+        }
+        sampledMoves.push_back({i, j});
+    }
+
+    vector<Individual> candidates(sampleMoves);
+    vector<double> objs(sampleMoves, 1e18);
+    vector<char> valid(sampleMoves, 0);
+
+#pragma omp parallel for schedule(dynamic)
+    for (int s = 0; s < sampleMoves; ++s) {
+        int i = sampledMoves[s].first;
+        int j = sampledMoves[s].second;
+
+        Individual cand = ind;  // thread-local copy
+        moveCustomerBlockInChromosome(cand, order[i], order[j]);
+        reDecodeAndEvaluate(cand, parameters, cargoLookup);
+
+        if (!cand.fitness.empty()) {
+            candidates[s] = std::move(cand);
+            objs[s] = candidates[s].fitness[0];
+            valid[s] = 1;
+        }
+    }
+
+    int bestIdx = -1;
+    double bestObj = base.fitness[0];
+
+    for (int s = 0; s < sampleMoves; ++s) {
+        if (valid[s] && objs[s] < bestObj - EPS) {
+            bestObj = objs[s];
+            bestIdx = s;
+        }
+    }
+
+    if (bestIdx != -1) {
+        ind = std::move(candidates[bestIdx]);
+        return true;
+    }
+
+    return false;
+}
+static bool doReinsertionOnceStable(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
+{
+    unordered_set<int> omegaSet;
+    for (const auto& rt : ind.rentedTrucks)
+        for (const auto& g : rt.assignedCargo)
+            omegaSet.insert(g.customerId);
+
+    vector<int> omega(omegaSet.begin(), omegaSet.end());
+    sort(omega.begin(), omega.end());  // 穩定順序，至少先排除 unordered_set 的亂序影響
+
+    for (int cid : omega) {
+        for (int area = 1; area <= regionNum; ++area) {
+            if (parameters.serviceRegion[cid - 1][area - 1] != 1) continue;
+
+            Individual backup = ind;
+            if (tryMoveRentedCustomerToSelfTruck(ind, cid, area, parameters, cargoLookup)) {
+                return true;
+            }
+            ind = std::move(backup);
+        }
+    }
+    return false;
+}
+
+static bool doForceSelfAttempt(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
+{
+    // 找目前所有 rented customers
+    unordered_set<int> rentedSet;
+    for (const auto& rt : ind.rentedTrucks) {
+        for (const auto& g : rt.assignedCargo) {
+            rentedSet.insert(g.customerId);
+        }
+    }
+
+    if (rentedSet.empty()) return false;
+
+    // baseline objective
+    Individual base = ind;
+    reDecodeAndEvaluate(base, parameters, cargoLookup);
+    if (base.fitness.empty()) return false;
+
+    const double baseObj = base.fitness[0];
+    const double EPS = 1e-9;
+
+    vector<int> rentedCustomers(rentedSet.begin(), rentedSet.end());
+    sort(rentedCustomers.begin(), rentedCustomers.end());
+
+    for (int cid : rentedCustomers) {
+
+        // 從 rented 取出整包貨
+        vector<Gene> pack = collectCustomerGenesFromRented(ind, cid);
+        if (pack.empty()) continue;
+
+        for (int area = 1; area <= regionNum; ++area) {
+
+            // 服務區限制
+            if (parameters.serviceRegion[cid - 1][area - 1] != 1) continue;
+
+            Individual backup = ind;
+
+            // 先從 rented 移掉這個 customer
+            removeCustomerFromRented(ind, cid);
+
+            // 加到對應 self-owned truck
+            Truck& selfT = ind.selfOwnedTrucks[area];
+            const auto originalCargo = selfT.assignedCargo;
+            const int n = (int)originalCargo.size();
+
+            bool accepted = false;
+
+            // 嘗試不同插入位置，不只放尾端
+            for (int pos = 0; pos <= n; ++pos) {
+                selfT.assignedCargo = originalCargo;
+
+                selfT.assignedCargo.insert(
+                    selfT.assignedCargo.begin() + pos,
+                    pack.begin(),
+                    pack.end()
+                );
+
+                // 先看這台車能不能重排成功
+                if (!repackTruck(selfT, cargoLookup, 80)) {
+                    continue;
+                }
+
+                // 整體重新解碼與評估
+                reDecodeAndEvaluate(ind, parameters, cargoLookup);
+
+                if (!ind.fitness.empty() && ind.fitness[0] < baseObj - EPS) {
+                    accepted = true;
+                    return true;
+                }
             }
 
-            // swap: bring bigger into A
-            auto A_to_B = getOSRCustomers_FromTo(customersInArea, parameters, omegaEmpty, areaA, areaB);
-            long long loadA = ind.selfOwnedTrucks[areaA].loadedVolume;
-            for (int i : Sb_to_A) {
-                long long vi = parameters.totalVolume[i - 1];
-                for (int j : A_to_B) {
-                    long long vj = parameters.totalVolume[j - 1];
-                    long long improve = vi - vj;
-                    if (improve > 0) step1.push_back({1, i, areaB, areaA, j, areaA, areaB, improve});
-                }
+            // 全部位置都不行，rollback
+            if (!accepted) {
+                ind = std::move(backup);
             }
         }
     }
 
-    sort(step1.begin(), step1.end(), [](const Move& a, const Move& b){
-        return a.pri > b.pri;
-    });
+    return false;
+}
+static bool doConsolidationOnce(
+    Individual& ind,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup
+){
+    for (int i = 0; i < (int)ind.rentedTrucks.size(); ++i) {
+        for (int j = i + 1; j < (int)ind.rentedTrucks.size(); ++j) {
+            auto backup = ind.rentedTrucks;
 
-    // --- try step1 then step2 ---
-    for (const auto& m1 : step1) {
-        Individual s0 = ind;
+            auto& A = ind.rentedTrucks[i];
+            auto& B = ind.rentedTrucks[j];
+            A.assignedCargo.insert(A.assignedCargo.end(), B.assignedCargo.begin(), B.assignedCargo.end());
 
-        for (int r1 = 0; r1 < repackRestarts; ++r1) {
-            ind = s0;
+            if (repackTruck(A, cargoLookup, 100)) {
+                ind.rentedTrucks.erase(ind.rentedTrucks.begin() + j);
+                return true;
+            } else {
+                ind.rentedTrucks = std::move(backup);
+            }
+        }
+    }
+    return false;
+}
 
-            if (m1.type == 0) applyMoveCustomerArea(ind, m1.c1, m1.to1);
-            else applySwapCustomersArea(ind, m1.c1, m1.from1, m1.c2, m1.from2);
+static void localSearchImproveByRealObjective(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    int budgetMoves = 100)
+{
+    static std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> pickOp(0, 4); // 0..4 共五種操作
+    const double EPS = 1e-9;
 
-            if (!evalCandidate_NoWorseObj1(ind, parameters, cargoLookup, baselineF1)) continue;
+    reDecodeAndEvaluate(ind, parameters, cargoLookup);
+    double bestObj = ind.fitness[0];
 
-            Obj2State st1 = getObj2State(ind);
+    for (int iter = 0; iter < budgetMoves; ++iter) {
+        int op = pickOp(rng);
 
-            // ✅ step1 允許不變差（plateau）
-            if (!notWorseObj2Lex(st1, base2)) continue;
+        Individual backup = ind;
+        bool moved = false;
 
-            Individual after1 = ind;
+        switch (op) {
+        case 0:
+            moved = doReinsertionOnceStable(ind, parameters, cargoLookup);
+            break;
+        case 1:
+            moved = doForceSelfAttempt(ind, parameters, cargoLookup);
+            break;
+        case 2:
+            moved = doExchangeOnce(ind, parameters, cargoLookup);
+            break;
+        case 3:
+            moved = doBlockSwapSampled(ind, parameters, cargoLookup);
+            break;
+        case 4:
+            moved = doBlockInsertSampled(ind, parameters, cargoLookup);
+            break;
+        default:
+            break;
+        }
 
-            // step2: 再做一個 move（這裡先用 insertion 就很有效；你要也可再加 swap）
-            unordered_map<int,int> custArea2;
-            vector<vector<int>> customersInArea2;
-            buildCustomerAreaMap_SelfOnly(after1, omegaEmpty, custArea2, customersInArea2);
+        if (!moved) {
+            ind = std::move(backup);
+            continue;
+        }
 
-            for (int areaB : neighbors) {
-                vector<int> cand2;
-                if (isReduceMaxPhase)
-                    cand2 = getOSRCustomers_FromTo(customersInArea2, parameters, omegaEmpty, areaA, areaB);
-                else
-                    cand2 = getOSRCustomers_FromTo(customersInArea2, parameters, omegaEmpty, areaB, areaA);
+        reDecodeAndEvaluate(ind, parameters, cargoLookup);
 
-                if (cand2.empty()) continue;
-                sortByVolumeDesc(cand2, parameters);
+        if (ind.fitness[0] < bestObj - EPS) {
+            bestObj = ind.fitness[0];
+        } else {
+            ind = std::move(backup);
+        }
+    }
+}
 
-                for (int cid2 : cand2) {
-                    Individual s1 = after1;
+void evaluateFitnessFullPacking(Individual& indiv, const Data& parameters) {
+    const double C1 = 5.41;
+    const double BIG = 1e12;
 
-                    for (int r2 = 0; r2 < repackRestarts; ++r2) {
-                        ind = s1;
+    const auto& forcedOutsource = TEST_FORCED_OUTSOURCE;
+    const auto& forcedSelfOwned = TEST_FORCED_SELFOWNED;
 
-                        if (isReduceMaxPhase) applyMoveCustomerArea(ind, cid2, areaB);
-                        else applyMoveCustomerArea(ind, cid2, areaA);
+    double outsourcedCost = 0.0;
+    double selfOwnedFuelCost = 0.0;
 
-                        if (!evalCandidate_NoWorseObj1(ind, parameters, cargoLookup, baselineF1)) continue;
+    Truck selfOwnedTrucks[regionNum + 1];
+    vector<Truck> rentedTrucks;
 
-                        Obj2State st2 = getObj2State(ind);
+    unordered_map<int, vector<Gene>> regionMap;
+    unordered_map<int, bool> isLoadedGlobal;
+    vector<int> notLoadedCustomer;
 
-                        // ✅ step2 要求嚴格改善（真正進步）
-                        if (betterObj2Lex(st2, base2)) return true;
+    auto cargoLookup = createCargoLookup(parameters);
+
+    for (int area = 1; area <= regionNum; ++area) {
+        selfOwnedTrucks[area].truckId = area;
+        selfOwnedTrucks[area].loadedVolume = 0;
+        selfOwnedTrucks[area].assignedCargo.clear();
+        selfOwnedTrucks[area].route.clear();
+    }
+
+    regionMap.clear();
+    isLoadedGlobal.clear();
+
+    for (const auto& gene : indiv.chromosome) {
+        isLoadedGlobal[gene.customerId] = false;
+        regionMap[gene.decodedServiceArea].push_back(gene);
+    }
+
+    // ==============================
+    // Self-owned loading
+    // ==============================
+    for (int area = 1; area <= regionNum; ++area) {
+        auto itRM = regionMap.find(area);
+        if (itRM == regionMap.end()) continue;
+
+        vector<Gene>& cargoList = itRM->second;
+
+        unordered_map<int, vector<Gene>> customerGrouped;
+        customerGrouped.reserve(cargoList.size() * 2 + 1);
+
+        for (int idx = (int)cargoList.size() - 1; idx >= 0; --idx) {
+            const Gene& g = cargoList[idx];
+            customerGrouped[g.customerId].push_back(g);
+        }
+
+        vector<int> customerOrder;
+        customerOrder.reserve(customerGrouped.size());
+
+        unordered_map<int, int> routePos;
+        const auto& baseRoute = parameters.route[area - 1];
+        for (int pos = 0; pos < (int)baseRoute.size(); ++pos) {
+            int node = baseRoute[pos];
+            if (node > 0) {
+                routePos[node] = pos;
+            }
+        }
+
+        for (const auto& kv : customerGrouped) {
+            int custId = kv.first;
+            if (forcedOutsource.count(custId)) continue;
+            customerOrder.push_back(custId);
+        }
+
+        sort(customerOrder.begin(), customerOrder.end(),
+            [&](int a, int b) {
+                bool inA = routePos.count(a);
+                bool inB = routePos.count(b);
+
+                if (inA && inB) return routePos[a] < routePos[b];
+                if (inA != inB) return inA > inB;
+                return a < b;
+            });
+
+        Truck& truck = selfOwnedTrucks[area];
+        BLPlacement3D loader(truck.length, truck.width, truck.height);
+        loader.setCargoLookup(cargoLookup);
+
+        for (int custId : customerOrder) {
+            auto& cargoGroup = customerGrouped[custId];
+
+            bool success = false;
+            vector<Gene> bestGroup = cargoGroup;
+
+            for (int trial = 0; trial < 5 && !success; ++trial) {
+                auto tempGroup = cargoGroup;
+
+                if (trial > 0) {
+                    static thread_local std::mt19937 rng(std::random_device{}());
+                    std::shuffle(tempGroup.begin(), tempGroup.end(), rng);
+                }
+
+                if (loader.tryInsert(tempGroup, 50)) {
+                    bestGroup = tempGroup;
+                    success = true;
+                } else {
+                    long long bestOverflow = 0;
+                    bool repaired = localSearchRotateAllAndTryInsert(
+                        loader,
+                        tempGroup,
+                        loader.cargoLookup,
+                        20,
+                        30,
+                        bestOverflow
+                    );
+
+                    if (repaired) {
+                        bestGroup = tempGroup;
+                        success = true;
                     }
                 }
             }
-        }
 
-        ind = s0;
+            if (success) {
+                cargoGroup = bestGroup;
+
+                truck.loadedVolume += parameters.totalVolume[custId - 1];
+                truck.assignedCargo.insert(
+                    truck.assignedCargo.end(),
+                    cargoGroup.begin(),
+                    cargoGroup.end()
+                );
+
+                isLoadedGlobal[custId] = true;
+
+                for (const auto& g : cargoGroup) {
+                    for (auto& indivGene : indiv.chromosome) {
+                        if (indivGene.customerId == g.customerId &&
+                            indivGene.cargoId == g.cargoId) {
+                            indivGene.position[0] = g.position[0];
+                            indivGene.position[1] = g.position[1];
+                            indivGene.position[2] = g.position[2];
+                            indivGene.undecodedRotation = g.undecodedRotation;
+                            indivGene.decodedRotation = g.decodedRotation;
+                        }
+                    }
+                }
+            }
+            // self-owned 裝不下，後面交給 rented 補救
+        }
     }
 
-    return false;
-}
+    // ==============================
+    // Collect not-loaded customers
+    // ==============================
+    notLoadedCustomer.clear();
 
-void localSearch_Obj2_TeacherStyle(
-    Individual& ind,
-    const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    int repackRestarts
-){
-    // 入口假設：ind 已經有有效的 fitness & trucks 狀態
-    if (ind.fitness.size() < 2) return;
-    const long long obj1Baseline = ind.fitness[1]; // ✅ Obj1 不變差（或你要完全不變就改 evalCandidate）
+    for (const auto& kv : isLoadedGlobal) {
+        if (!kv.second) {
+            notLoadedCustomer.push_back(kv.first);
+        }
+    }
 
-    bool improved = true;
-    while (improved) {
-        improved = false;
+    for (int custId : forcedOutsource) {
+        if (!isLoadedGlobal[custId]) {
+            notLoadedCustomer.push_back(custId);
+        }
+    }
 
-        // ===================== Phase A: Reduce Max =====================
-        {
-            vector<int> areas(regionNum);
-            iota(areas.begin(), areas.end(), 1);
-            sort(areas.begin(), areas.end(), [&](int x, int y){
-                return ind.selfOwnedTrucks[x].loadedVolume > ind.selfOwnedTrucks[y].loadedVolume;
-            });
+    sort(notLoadedCustomer.begin(), notLoadedCustomer.end());
+    notLoadedCustomer.erase(
+        unique(notLoadedCustomer.begin(), notLoadedCustomer.end()),
+        notLoadedCustomer.end()
+    );
 
-            for (int a : areas) {
-                // ✅ 先用兩步 look-ahead（允許 step1 plateau，step2 必須嚴格改善 Obj2Lex）
-                if (tryTwoStepImproveOnArea_Obj2Lex(
-                        ind, parameters, cargoLookup,
-                        obj1Baseline, a, repackRestarts,
-                        /*isReduceMaxPhase=*/true
-                    )) {
-                    ind.fitness.clear();
-                    evaluateFitness(ind, parameters);
-                    improved = true;
-                    break;
-                }
+    // ==============================
+    // Self-owned fuel cost
+    // ==============================
+    selfOwnedFuelCost = 0.0;
 
-                // （可選）fallback：原本一步 operator（如果你想保留）
-                if (tryReduceMaxOnArea_KeepObj1Baseline(
-                        ind, parameters, cargoLookup,
-                        obj1Baseline, a, repackRestarts
-                    )) {
-                    ind.fitness.clear();
-                    evaluateFitness(ind, parameters);
-                    improved = true;
-                    break;
-                }
+    for (int area = 1; area <= regionNum; ++area) {
+        const auto& baseRoute = parameters.route[area - 1];
+
+        unordered_set<int> servedSet;
+        servedSet.reserve(selfOwnedTrucks[area].assignedCargo.size() * 2 + 1);
+
+        for (const auto& g : selfOwnedTrucks[area].assignedCargo) {
+            servedSet.insert(g.customerId);
+        }
+
+        if (servedSet.empty()) {
+            selfOwnedTrucks[area].route.clear();
+            continue;
+        }
+
+        vector<int> servedSeq;
+        servedSeq.reserve(servedSet.size());
+
+        for (int node : baseRoute) {
+            if (node > 0 && servedSet.count(node)) {
+                servedSeq.push_back(node);
             }
         }
 
-        // ===================== Phase B: Increase Min =====================
-        {
-            vector<int> areas(regionNum);
-            iota(areas.begin(), areas.end(), 1);
-            sort(areas.begin(), areas.end(), [&](int x, int y){
-                return ind.selfOwnedTrucks[x].loadedVolume < ind.selfOwnedTrucks[y].loadedVolume;
-            });
-
-            for (int a : areas) {
-                if (tryTwoStepImproveOnArea_Obj2Lex(
-                        ind, parameters, cargoLookup,
-                        obj1Baseline, a, repackRestarts,
-                        /*isReduceMaxPhase=*/false
-                    )) {
-                    ind.fitness.clear();
-                    evaluateFitness(ind, parameters);
-                    improved = true;
-                    break;
-                }
-
-                // （可選）fallback：原本一步 operator
-                if (tryIncreaseMinOnArea_KeepObj1Baseline(
-                        ind, parameters, cargoLookup,
-                        obj1Baseline, a, repackRestarts
-                    )) {
-                    ind.fitness.clear();
-                    evaluateFitness(ind, parameters);
-                    improved = true;
+        for (int cid : servedSet) {
+            bool found = false;
+            for (int node : servedSeq) {
+                if (node == cid) {
+                    found = true;
                     break;
                 }
             }
+            if (!found) {
+                servedSeq.push_back(cid);
+            }
+        }
+
+        if (servedSeq.empty()) {
+            selfOwnedTrucks[area].route.clear();
+            continue;
+        }
+
+        selfOwnedTrucks[area].route = servedSeq;
+
+        double distSum = 0.0;
+        distSum += parameters.getDistance(0, servedSeq.front());
+
+        for (int k = 0; k + 1 < (int)servedSeq.size(); ++k) {
+            distSum += parameters.getDistance(servedSeq[k], servedSeq[k + 1]);
+        }
+
+        distSum += parameters.getDistance(servedSeq.back(), 0);
+
+        selfOwnedFuelCost += distSum;
+    }
+
+    // ==============================
+    // Rented loading
+    // ==============================
+    size_t cursor = 0;
+    int rentedTruckId = 0;
+    unordered_set<int> rentedSeen;
+
+    while (cursor < notLoadedCustomer.size()) {
+        Truck rentedTruck;
+        rentedTruck.truckId = ++rentedTruckId;
+        rentedTruck.loadedVolume = 0;
+        rentedTruck.assignedCargo.clear();
+        rentedTruck.route.clear();
+
+        BLPlacement3D loader(rentedTruck.length, rentedTruck.width, rentedTruck.height);
+        loader.setCargoLookup(cargoLookup);
+
+        bool anyLoadedThisTruck = false;
+
+        for (; cursor < notLoadedCustomer.size(); ++cursor) {
+            int custId = notLoadedCustomer[cursor];
+
+            if (rentedSeen.count(custId)) continue;
+            if (forcedSelfOwned.count(custId)) continue;
+
+            vector<Gene> cargoGroup;
+            cargoGroup.reserve(16);
+
+            for (const auto& g : indiv.chromosome) {
+                if (g.customerId == custId) {
+                    cargoGroup.push_back(g);
+                }
+            }
+
+            if (cargoGroup.empty()) continue;
+
+            bool canLoad = loader.tryInsert(cargoGroup, 50);
+
+            if (!canLoad) {
+                long long bestOverflow = 0;
+                canLoad = localSearchRotateAllAndTryInsert(
+                    loader,
+                    cargoGroup,
+                    loader.cargoLookup,
+                    20,
+                    30,
+                    bestOverflow
+                );
+            }
+
+            if (canLoad) {
+                anyLoadedThisTruck = true;
+                rentedSeen.insert(custId);
+
+                rentedTruck.loadedVolume += parameters.totalVolume[custId - 1];
+                rentedTruck.assignedCargo.insert(
+                    rentedTruck.assignedCargo.end(),
+                    cargoGroup.begin(),
+                    cargoGroup.end()
+                );
+                rentedTruck.route.push_back(custId);
+
+                double volume = parameters.totalVolume[custId - 1];
+                int v = (int)ceil(volume);
+                double cost = 100 + 30 * max(0, v - 3);
+
+                outsourcedCost += cost;
+            } else {
+                indiv.fitness.clear();
+                indiv.fitness.push_back(BIG);
+                return;
+            }
+        }
+
+        if (anyLoadedThisTruck) {
+            rentedTrucks.push_back(rentedTruck);
+        } else {
+            break;
         }
     }
+
+    for (int area = 1; area <= regionNum; ++area) {
+        indiv.selfOwnedTrucks[area] = selfOwnedTrucks[area];
+    }
+    indiv.rentedTrucks = rentedTrucks;
+
+    for (int cid : forcedSelfOwned) {
+        bool inSelfOwned = false;
+
+        for (int area = 1; area <= regionNum; ++area) {
+            for (const auto& g : indiv.selfOwnedTrucks[area].assignedCargo) {
+                if (g.customerId == cid) {
+                    inSelfOwned = true;
+                    break;
+                }
+            }
+            if (inSelfOwned) break;
+        }
+
+        if (!inSelfOwned) {
+            indiv.fitness.clear();
+            indiv.fitness.push_back(BIG);
+            return;
+        }
+    }
+
+    double obj = outsourcedCost + C1 * selfOwnedFuelCost;
+
+    indiv.fitness.clear();
+    indiv.fitness.push_back(obj);
 }
