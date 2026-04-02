@@ -292,27 +292,19 @@ cout << "Best feasible cost = " << globalBest.fitness[0] << '\n';
 
 // ⭐ FULL packing 多跑幾次，挑最好的穩定結果
 {
-    const int fullPackingTrials = 500;
+    Individual rebuilt = globalBest;
 
-    Individual bestPacked = globalBest;
-    double bestPackedCost = std::numeric_limits<double>::infinity();
+    bool ok = reconstructFullPackingFromBestAssignment(
+        rebuilt,
+        parameters,
+        300,   // selfOwnedTrialsPerArea
+        100    // rentedTrialsPerCustomer
+    );
 
-    for (int t = 0; t < fullPackingTrials; ++t) {
-        Individual trialIndiv = globalBest;
-        trialIndiv.fitness.clear();
-
-        evaluateFitnessFullPacking(trialIndiv, parameters);
-
-        if (!trialIndiv.fitness.empty() &&
-            trialIndiv.fitness[0] < bestPackedCost) {
-            bestPackedCost = trialIndiv.fitness[0];
-            bestPacked = trialIndiv;
-        }
+    if (ok && !rebuilt.fitness.empty() &&
+        rebuilt.fitness[0] < 1e12) {
+        globalBest = rebuilt;
     }
-
-    if (bestPackedCost < globalBest.fitness[0]) {
-    globalBest = bestPacked;
-}
 }
 
 cout << "\n===== GA BEST FIXED COST =====\n";

@@ -1777,3 +1777,375 @@ void evaluateFitnessFullPacking(Individual& indiv, const Data& parameters) {
     indiv.fitness.clear();
     indiv.fitness.push_back(obj);
 }
+
+bool reconstructFullPackingFromBestAssignment(
+    Individual& indiv,
+    const Data& parameters,
+    int selfOwnedTrialsPerArea = 200,
+    int rentedTrialsPerCustomer = 100
+) {
+    const double C1 = 5.41;
+    const double BIG = 1e12;
+
+    const auto& forcedOutsource = TEST_FORCED_OUTSOURCE;
+    const auto& forcedSelfOwned = TEST_FORCED_SELFOWNED;
+
+    auto cargoLookup = createCargoLookup(parameters);
+
+    double outsourcedCost = 0.0;
+    double selfOwnedFuelCost = 0.0;
+
+    Truck newSelfOwnedTrucks[regionNum + 1];
+    vector<Truck> newRentedTrucks;
+
+    unordered_map<int, bool> isLoadedGlobal;
+
+    // ========= init =========
+    for (int area = 1; area <= regionNum; ++area) {
+        newSelfOwnedTrucks[area] = Truck();
+        newSelfOwnedTrucks[area].truckId = area;
+        newSelfOwnedTrucks[area].loadedVolume = 0.0;
+        newSelfOwnedTrucks[area].assignedCargo.clear();
+        newSelfOwnedTrucks[area].route.clear();
+    }
+
+    for (const auto& g : indiv.chromosome) {
+        isLoadedGlobal[g.customerId] = false;
+    }
+
+    // 儲存原本 FAST 找到的「固定自有車 assignment」
+    vector<vector<int>> targetRoutes(regionNum + 1);
+    for (int area = 1; area <= regionNum; ++area) {
+        targetRoutes[area] = indiv.selfOwnedTrucks[area].route;
+
+        // 清掉 0 / 去重
+        vector<int>& r = targetRoutes[area];
+        r.erase(remove(r.begin(), r.end(), 0), r.end());
+        sort(r.begin(), r.end());
+        r.erase(unique(r.begin(), r.end()), r.end());
+
+        // 用固定路線順序重建一次，避免順序漂移
+        r = buildRouteFromFixedOrder(r, parameters, area);
+    }
+
+    // 先建立 gene lookup：customer -> cargo genes
+    unordered_map<int, vector<Gene>> genesByCustomer;
+    genesByCustomer.reserve(indiv.chromosome.size() * 2 + 1);
+    for (const auto& g : indiv.chromosome) {
+        genesByCustomer[g.customerId].push_back(g);
+    }
+
+    // ========= Self-owned reconstruction =========
+    for (int area = 1; area <= regionNum; ++area) {
+        vector<int> customerOrder = targetRoutes[area];
+
+        // forcedSelfOwned 若被分到這個 area，但 route 裡沒有，補進去
+        for (int cid : forcedSelfOwned) {
+            bool belongsToArea = false;
+            for (const auto& g : indiv.chromosome) {
+                if (g.customerId == cid && g.decodedServiceArea == area) {
+                    belongsToArea = true;
+                    break;
+                }
+            }
+            if (belongsToArea &&
+                find(customerOrder.begin(), customerOrder.end(), cid) == customerOrder.end()) {
+                customerOrder.push_back(cid);
+            }
+        }
+
+        customerOrder.erase(
+            remove_if(customerOrder.begin(), customerOrder.end(),
+                      [&](int cid) { return forcedOutsource.count(cid) > 0; }),
+            customerOrder.end()
+        );
+
+        if (customerOrder.empty()) {
+            newSelfOwnedTrucks[area].route.clear();
+            continue;
+        }
+
+        // 用 base route 順序整理
+        customerOrder = buildRouteFromFixedOrder(customerOrder, parameters, area);
+
+        bool areaSuccess = false;
+        Truck bestTruck;
+        unordered_map<int, vector<Gene>> bestPackedGenesByCustomer;
+
+        for (int trial = 0; trial < selfOwnedTrialsPerArea && !areaSuccess; ++trial) {
+            Truck truck;
+            truck = Truck();
+            truck.truckId = area;
+            truck.loadedVolume = 0.0;
+            truck.assignedCargo.clear();
+            truck.route.clear();
+
+            BLPlacement3D loader(truck.length, truck.width, truck.height);
+            loader.setCargoLookup(cargoLookup);
+
+            bool allLoaded = true;
+            unordered_map<int, vector<Gene>> packedGenesByCustomer;
+
+            for (int custId : customerOrder) {
+                auto it = genesByCustomer.find(custId);
+                if (it == genesByCustomer.end() || it->second.empty()) {
+                    allLoaded = false;
+                    break;
+                }
+
+                vector<Gene> baseGroup = it->second;
+                bool success = false;
+                vector<Gene> bestGroup = baseGroup;
+
+                for (int inner = 0; inner < 5 && !success; ++inner) {
+                    vector<Gene> tempGroup = baseGroup;
+
+                    if (inner > 0) {
+                        static thread_local std::mt19937 rng(std::random_device{}());
+                        std::shuffle(tempGroup.begin(), tempGroup.end(), rng);
+                    }
+
+                    if (loader.tryInsert(tempGroup, 50)) {
+                        bestGroup = tempGroup;
+                        success = true;
+                    } else {
+                        long long bestOverflow = 0;
+                        bool repaired = localSearchRotateAllAndTryInsert(
+                            loader,
+                            tempGroup,
+                            loader.cargoLookup,
+                            20,
+                            30,
+                            bestOverflow
+                        );
+
+                        if (repaired) {
+                            bestGroup = tempGroup;
+                            success = true;
+                        }
+                    }
+                }
+
+                if (!success) {
+                    allLoaded = false;
+                    break;
+                }
+
+                packedGenesByCustomer[custId] = bestGroup;
+                truck.loadedVolume += parameters.totalVolume[custId - 1];
+                truck.assignedCargo.insert(
+                    truck.assignedCargo.end(),
+                    bestGroup.begin(),
+                    bestGroup.end()
+                );
+            }
+
+            if (allLoaded) {
+                truck.route = customerOrder;
+                bestTruck = truck;
+                bestPackedGenesByCustomer = packedGenesByCustomer;
+                areaSuccess = true;
+            }
+        }
+
+        if (!areaSuccess) {
+            indiv.fitness.clear();
+            indiv.fitness.push_back(BIG);
+            return false;
+        }
+
+        newSelfOwnedTrucks[area] = bestTruck;
+
+        // 寫回 chromosome positions / rotations
+        for (const auto& kv : bestPackedGenesByCustomer) {
+            int custId = kv.first;
+            isLoadedGlobal[custId] = true;
+
+            for (const auto& packedGene : kv.second) {
+                for (auto& indivGene : indiv.chromosome) {
+                    if (indivGene.customerId == packedGene.customerId &&
+                        indivGene.cargoId == packedGene.cargoId) {
+                        indivGene.position[0] = packedGene.position[0];
+                        indivGene.position[1] = packedGene.position[1];
+                        indivGene.position[2] = packedGene.position[2];
+                        indivGene.undecodedRotation = packedGene.undecodedRotation;
+                        indivGene.decodedRotation = packedGene.decodedRotation;
+                    }
+                }
+            }
+        }
+    }
+
+    // ========= collect outsourced customers =========
+    vector<int> notLoadedCustomers;
+    for (const auto& kv : isLoadedGlobal) {
+        if (!kv.second) {
+            notLoadedCustomers.push_back(kv.first);
+        }
+    }
+
+    for (int cid : forcedOutsource) {
+        if (!isLoadedGlobal[cid]) {
+            notLoadedCustomers.push_back(cid);
+        }
+    }
+
+    sort(notLoadedCustomers.begin(), notLoadedCustomers.end());
+    notLoadedCustomers.erase(
+        unique(notLoadedCustomers.begin(), notLoadedCustomers.end()),
+        notLoadedCustomers.end()
+    );
+
+    // ========= Rented reconstruction =========
+    // 簡化成「每個 outsourced customer 一台 rented truck」
+    // 因為你現在的 outsourced cost 是按 customer 算，和合併到同台 rented truck 無關
+    int rentedTruckId = 0;
+
+    for (int custId : notLoadedCustomers) {
+        if (forcedSelfOwned.count(custId)) {
+            indiv.fitness.clear();
+            indiv.fitness.push_back(BIG);
+            return false;
+        }
+
+        auto it = genesByCustomer.find(custId);
+        if (it == genesByCustomer.end() || it->second.empty()) {
+            indiv.fitness.clear();
+            indiv.fitness.push_back(BIG);
+            return false;
+        }
+
+        bool success = false;
+        Truck rentedTruck;
+        unordered_map<int, vector<Gene>> packedGenesByCustomer;
+
+        for (int trial = 0; trial < rentedTrialsPerCustomer && !success; ++trial) {
+            Truck trialTruck;
+            trialTruck = Truck();
+            trialTruck.truckId = ++rentedTruckId;
+            trialTruck.loadedVolume = 0.0;
+            trialTruck.assignedCargo.clear();
+            trialTruck.route.clear();
+
+            BLPlacement3D loader(trialTruck.length, trialTruck.width, trialTruck.height);
+            loader.setCargoLookup(cargoLookup);
+
+            vector<Gene> baseGroup = it->second;
+            vector<Gene> bestGroup = baseGroup;
+            bool packed = false;
+
+            for (int inner = 0; inner < 5 && !packed; ++inner) {
+                vector<Gene> tempGroup = baseGroup;
+
+                if (inner > 0) {
+                    static thread_local std::mt19937 rng(std::random_device{}());
+                    std::shuffle(tempGroup.begin(), tempGroup.end(), rng);
+                }
+
+                if (loader.tryInsert(tempGroup, 50)) {
+                    bestGroup = tempGroup;
+                    packed = true;
+                } else {
+                    long long bestOverflow = 0;
+                    bool repaired = localSearchRotateAllAndTryInsert(
+                        loader,
+                        tempGroup,
+                        loader.cargoLookup,
+                        20,
+                        30,
+                        bestOverflow
+                    );
+
+                    if (repaired) {
+                        bestGroup = tempGroup;
+                        packed = true;
+                    }
+                }
+            }
+
+            if (packed) {
+                trialTruck.loadedVolume += parameters.totalVolume[custId - 1];
+                trialTruck.assignedCargo = bestGroup;
+                trialTruck.route.push_back(custId);
+
+                rentedTruck = trialTruck;
+                packedGenesByCustomer[custId] = bestGroup;
+                success = true;
+            }
+        }
+
+        if (!success) {
+            indiv.fitness.clear();
+            indiv.fitness.push_back(BIG);
+            return false;
+        }
+
+        newRentedTrucks.push_back(rentedTruck);
+
+        for (const auto& packedGene : packedGenesByCustomer[custId]) {
+            for (auto& indivGene : indiv.chromosome) {
+                if (indivGene.customerId == packedGene.customerId &&
+                    indivGene.cargoId == packedGene.cargoId) {
+                    indivGene.position[0] = packedGene.position[0];
+                    indivGene.position[1] = packedGene.position[1];
+                    indivGene.position[2] = packedGene.position[2];
+                    indivGene.undecodedRotation = packedGene.undecodedRotation;
+                    indivGene.decodedRotation = packedGene.decodedRotation;
+                }
+            }
+        }
+
+        double volume = parameters.totalVolume[custId - 1];
+        int v = (int)ceil(volume);
+        outsourcedCost += 100 + 30 * max(0, v - 3);
+    }
+
+    // ========= self-owned fuel cost =========
+    selfOwnedFuelCost = 0.0;
+    for (int area = 1; area <= regionNum; ++area) {
+        const auto& route = newSelfOwnedTrucks[area].route;
+        if (route.empty()) continue;
+
+        double dist = 0.0;
+        dist += parameters.getDistance(0, route.front());
+
+        for (int i = 0; i + 1 < (int)route.size(); ++i) {
+            dist += parameters.getDistance(route[i], route[i + 1]);
+        }
+
+        dist += parameters.getDistance(route.back(), 0);
+        selfOwnedFuelCost += dist;
+    }
+
+    // ========= forced self-owned check =========
+    for (int cid : forcedSelfOwned) {
+        bool inSelfOwned = false;
+        for (int area = 1; area <= regionNum; ++area) {
+            for (const auto& g : newSelfOwnedTrucks[area].assignedCargo) {
+                if (g.customerId == cid) {
+                    inSelfOwned = true;
+                    break;
+                }
+            }
+            if (inSelfOwned) break;
+        }
+
+        if (!inSelfOwned) {
+            indiv.fitness.clear();
+            indiv.fitness.push_back(BIG);
+            return false;
+        }
+    }
+
+    // ========= final write back =========
+    for (int area = 1; area <= regionNum; ++area) {
+        indiv.selfOwnedTrucks[area] = newSelfOwnedTrucks[area];
+    }
+    indiv.rentedTrucks = newRentedTrucks;
+
+    double obj = outsourcedCost + C1 * selfOwnedFuelCost;
+    indiv.fitness.clear();
+    indiv.fitness.push_back(obj);
+
+    return true;
+}
