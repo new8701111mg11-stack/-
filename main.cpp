@@ -128,6 +128,297 @@ static int checkIndividualPlacement(const Individual& ind,
 bool isBetterCostOnly(const Individual& a, const Individual& b) {
     return a.fitness[0] < b.fitness[0];
 }
+
+static void printFailedTruckRecordsSummary(
+    const std::vector<BetterButFailedRecord>& records,
+    const std::string& title = "Failed Truck Records"
+) {
+    std::cout << "\n===== " << title << " =====\n";
+    std::cout << "record count = " << records.size() << "\n";
+
+    for (size_t i = 0; i < records.size(); ++i) {
+        const auto& r = records[i];
+
+        std::cout << "\n[Record #" << i << "]"
+                  << " area=" << r.area
+                  << " truckId=" << r.truckId
+                  << " tryingCustomer=" << r.tryingCustomer
+                  << " failedCustomer=" << r.failedCustomer
+                  << " failedCargo=" << r.failedCargo
+                  << "\n";
+
+        std::cout << "  fitnessValue=" << r.fitnessValue << "\n";
+
+        std::cout << "  candidateCount=" << r.candidateCount
+                  << " boundaryFailCount=" << r.boundaryFailCount
+                  << " collisionFailCount=" << r.collisionFailCount
+                  << "\n";
+
+        std::cout << "  hasBoundaryZeroCandidate=" << r.hasBoundaryZeroCandidate
+                  << " hasBoundaryZeroButCollision=" << r.hasBoundaryZeroButCollision
+                  << " collisionDominant=" << r.collisionDominant
+                  << "\n";
+
+        std::cout << "  bestBoundaryViolation=" << r.bestBoundaryViolation
+                  << " overflow=(" << r.overflowX
+                  << ", " << r.overflowY
+                  << ", " << r.overflowZ << ")"
+                  << " bestTotalOverlap=" << r.bestTotalOverlap
+                  << "\n";
+
+        std::cout << "  container=("
+                  << r.containerL << ", "
+                  << r.containerW << ", "
+                  << r.containerH << ")\n";
+
+        std::cout << "  loadedCustomerList: ";
+        if (r.loadedCustomerList.empty()) {
+            std::cout << "(empty)";
+        } else {
+            for (size_t j = 0; j < r.loadedCustomerList.size(); ++j) {
+                std::cout << r.loadedCustomerList[j];
+                if (j + 1 < r.loadedCustomerList.size()) std::cout << ", ";
+            }
+        }
+        std::cout << "\n";
+
+        std::cout << "  truckCaseCustomerList: ";
+        if (r.truckCaseCustomerList.empty()) {
+            std::cout << "(empty)";
+        } else {
+            for (size_t j = 0; j < r.truckCaseCustomerList.size(); ++j) {
+                std::cout << r.truckCaseCustomerList[j];
+                if (j + 1 < r.truckCaseCustomerList.size()) std::cout << ", ";
+            }
+        }
+        std::cout << "\n";
+
+        std::cout << "  baseLoadedCargoes (" << r.baseLoadedCargoes.size() << "):\n";
+        for (const auto& c : r.baseLoadedCargoes) {
+            std::cout << "    [B] cust=" << c.customerId
+                      << " cargo=" << c.cargoId
+                      << " size=(" << c.l << "," << c.w << "," << c.h << ")"
+                      << " allowedRot=[";
+            for (int rr = 0; rr < 6; ++rr) {
+                std::cout << c.orientation[rr];
+                if (rr + 1 < 6) std::cout << ",";
+            }
+            std::cout << "]\n";
+        }
+
+        std::cout << "  tryingCustomerCargoes (" << r.tryingCustomerCargoes.size() << "):\n";
+        for (const auto& c : r.tryingCustomerCargoes) {
+            std::cout << "    [T] cust=" << c.customerId
+                      << " cargo=" << c.cargoId
+                      << " size=(" << c.l << "," << c.w << "," << c.h << ")"
+                      << " allowedRot=[";
+            for (int rr = 0; rr < 6; ++rr) {
+                std::cout << c.orientation[rr];
+                if (rr + 1 < 6) std::cout << ",";
+            }
+            std::cout << "]\n";
+        }
+
+        std::cout << "  allCargoesForTruckCase (" << r.allCargoesForTruckCase.size() << "):\n";
+        for (const auto& c : r.allCargoesForTruckCase) {
+            std::cout << "    [A] cust=" << c.customerId
+                      << " cargo=" << c.cargoId
+                      << " size=(" << c.l << "," << c.w << "," << c.h << ")"
+                      << " allowedRot=[";
+            for (int rr = 0; rr < 6; ++rr) {
+                std::cout << c.orientation[rr];
+                if (rr + 1 < 6) std::cout << ",";
+            }
+            std::cout << "]\n";
+        }
+    }
+}
+
+static SingleTruckGurobiCase buildSingleTruckGurobiCaseFromRecord(
+    const BetterButFailedRecord& rec,
+    int caseId
+) {
+    SingleTruckGurobiCase out;
+
+    out.caseId = caseId;
+    out.fitnessValue = rec.fitnessValue;
+
+    out.area = rec.area;
+    out.truckId = rec.truckId;
+
+    out.tryingCustomer = rec.tryingCustomer;
+    out.failedCustomer = rec.failedCustomer;
+    out.failedCargo = rec.failedCargo;
+
+    out.containerL = rec.containerL;
+    out.containerW = rec.containerW;
+    out.containerH = rec.containerH;
+
+    out.candidateCount = rec.candidateCount;
+    out.boundaryFailCount = rec.boundaryFailCount;
+    out.collisionFailCount = rec.collisionFailCount;
+    out.bestBoundaryViolation = rec.bestBoundaryViolation;
+    out.bestTotalOverlap = rec.bestTotalOverlap;
+    out.collisionDominant = rec.collisionDominant ? 1 : 0;
+
+    out.loadedCustomerList = rec.loadedCustomerList;
+    out.truckCaseCustomerList = rec.truckCaseCustomerList;
+    out.fullPlannedCustomerList = rec.fullPlannedCustomerList;
+    out.remainingCustomerListAfterFail = rec.remainingCustomerListAfterFail;
+    out.failIndexInPlannedRoute = rec.failIndexInPlannedRoute;
+
+    // 1 = loaded before fail
+    for (const auto& c : rec.baseLoadedCargoes) {
+        SingleTruckGurobiCase::Item item;
+        item.customerId = c.customerId;
+        item.cargoId = c.cargoId;
+        item.l = c.l;
+        item.w = c.w;
+        item.h = c.h;
+        item.isPreloaded = 1;
+        item.itemRole = 1;
+        for (int r = 0; r < 6; ++r) item.orientation[r] = c.orientation[r];
+        out.items.push_back(item);
+    }
+
+    // 2 = trying customer
+    for (const auto& c : rec.tryingCustomerCargoes) {
+        SingleTruckGurobiCase::Item item;
+        item.customerId = c.customerId;
+        item.cargoId = c.cargoId;
+        item.l = c.l;
+        item.w = c.w;
+        item.h = c.h;
+        item.isPreloaded = 0;
+        item.itemRole = 2;
+        for (int r = 0; r < 6; ++r) item.orientation[r] = c.orientation[r];
+        out.items.push_back(item);
+    }
+
+    // 3 = remaining customers after fail
+    for (const auto& c : rec.remainingCustomerCargoes) {
+        SingleTruckGurobiCase::Item item;
+        item.customerId = c.customerId;
+        item.cargoId = c.cargoId;
+        item.l = c.l;
+        item.w = c.w;
+        item.h = c.h;
+        item.isPreloaded = 0;
+        item.itemRole = 3;
+        for (int r = 0; r < 6; ++r) item.orientation[r] = c.orientation[r];
+        out.items.push_back(item);
+    }
+
+    return out;
+}
+
+
+
+static void exportSingleTruckGurobiCaseToTxt(
+    const SingleTruckGurobiCase& c,
+    const std::string& filePath
+) {
+    std::ofstream fout(filePath);
+    if (!fout) {
+        std::cerr << "[WARN] cannot open file: " << filePath << "\n";
+        return;
+    }
+
+    fout << "CASE_ID " << c.caseId << "\n";
+    fout << "FITNESS " << std::fixed << std::setprecision(6) << c.fitnessValue << "\n";
+
+    fout << "AREA " << c.area << "\n";
+    fout << "TRUCK_ID " << c.truckId << "\n";
+
+    fout << "TRYING_CUSTOMER " << c.tryingCustomer << "\n";
+    fout << "FAILED_CUSTOMER " << c.failedCustomer << "\n";
+    fout << "FAILED_CARGO " << c.failedCargo << "\n";
+
+    fout << "CONTAINER " << c.containerL << " " << c.containerW << " " << c.containerH << "\n";
+
+    fout << "CANDIDATE_COUNT " << c.candidateCount << "\n";
+    fout << "BOUNDARY_FAIL_COUNT " << c.boundaryFailCount << "\n";
+    fout << "COLLISION_FAIL_COUNT " << c.collisionFailCount << "\n";
+    fout << "BEST_BOUNDARY_VIOLATION " << std::fixed << std::setprecision(6) << c.bestBoundaryViolation << "\n";
+    fout << "BEST_TOTAL_OVERLAP " << std::fixed << std::setprecision(6) << c.bestTotalOverlap << "\n";
+    fout << "COLLISION_DOMINANT " << c.collisionDominant << "\n";
+
+    fout << "LOADED_CUSTOMERS_BEFORE_FAIL";
+    for (int cid : c.loadedCustomerList) {
+        fout << " " << cid;
+    }
+    fout << "\n";
+
+    fout << "TRUCK_CASE_CUSTOMERS";
+    for (int cid : c.truckCaseCustomerList) {
+        fout << " " << cid;
+    }
+    fout << "\n";
+
+    fout << "FULL_PLANNED_CUSTOMERS";
+    for (int cid : c.fullPlannedCustomerList) {
+        fout << " " << cid;
+    }
+    fout << "\n";
+
+    fout << "REMAINING_CUSTOMERS_AFTER_FAIL";
+    for (int cid : c.remainingCustomerListAfterFail) {
+        fout << " " << cid;
+    }
+    fout << "\n";
+
+    fout << "FAIL_INDEX_IN_PLANNED_ROUTE " << c.failIndexInPlannedRoute << "\n";
+
+    fout << "ITEM_COUNT " << c.items.size() << "\n";
+    fout << "ITEMS_BEGIN\n";
+    fout << "# customerId cargoId l w h isPreloaded itemRole ori1 ori2 ori3 ori4 ori5 ori6\n";
+
+    for (const auto& item : c.items) {
+        fout << item.customerId << " "
+             << item.cargoId << " "
+             << item.l << " "
+             << item.w << " "
+             << item.h << " "
+             << item.isPreloaded << " "
+             << item.itemRole << " "
+             << item.orientation[0] << " "
+             << item.orientation[1] << " "
+             << item.orientation[2] << " "
+             << item.orientation[3] << " "
+             << item.orientation[4] << " "
+             << item.orientation[5] << "\n";
+    }
+
+    fout << "ITEMS_END\n";
+}
+
+static void exportSavedViolationSolutionsToTxt(
+    const std::vector<SavedViolationSolution>& sols,
+    const std::string& prefix = "saved_sol"
+) {
+    int globalCaseId = 0;
+
+    for (size_t si = 0; si < sols.size(); ++si) {
+        const auto& sol = sols[si];
+
+        for (size_t ri = 0; ri < sol.failedRecords.size(); ++ri) {
+            SingleTruckGurobiCase c =
+                buildSingleTruckGurobiCaseFromRecord(sol.failedRecords[ri], globalCaseId);
+
+            std::ostringstream oss;
+            oss << prefix
+                << "_" << si
+                << "_case_" << ri
+                << "_area" << c.area
+                << "_truck" << c.truckId
+                << "_tryCust" << c.tryingCustomer
+                << ".txt";
+
+            exportSingleTruckGurobiCaseToTxt(c, oss.str());
+            ++globalCaseId;
+        }
+    }
+}
 int main(){
     using Clock = std::chrono::high_resolution_clock;
     auto t_start = Clock::now();
@@ -158,6 +449,7 @@ int main(){
 
 std::vector<std::pair<int, double>> obj1_improve_points;
 std::vector<std::pair<int, double>> obj1_best_so_far_series;
+std::vector<SavedViolationSolution> savedViolationSolutions;
 
 double bestObj1SoFar = std::numeric_limits<double>::infinity();
 LoadingCache loadingCache;   // ⭐ 放這裡
@@ -177,12 +469,26 @@ for (int generation = 0; generation < maxGenerations; ++generation) {
 
         population[i].fitness.clear();
         evaluateFitness(population[i], parameters, loadingCache);
-        cout <<1 ;
+        if (!population[i].fitness.empty() &&
+            population[i].fitness[0] < 1e12 &&!population[i].failedTruckRecords.empty() &&population[i].failedTruckRecords.size() <= 2) {
+
+            SavedViolationSolution cand = buildSavedViolationSolution(population[i], 2);
+            tryAddSavedViolationSolution(savedViolationSolutions, cand, 5);
+            cout << "[SavedViolationSolutions] count = "
+            << savedViolationSolutions.size() << "\n";
+        }
         if (!population[i].rentedTrucks.empty()) {
             localSearchImproveByRealObjective(population[i], parameters, cargoLookUp, 10);
 
             population[i].fitness.clear();
             evaluateFitness(population[i], parameters, loadingCache);
+            if (!population[i].fitness.empty() &&
+            population[i].fitness[0] < 1e12 &&!population[i].failedTruckRecords.empty() &&population[i].failedTruckRecords.size() <= 2) {
+
+            SavedViolationSolution cand = buildSavedViolationSolution(population[i], 2);
+            tryAddSavedViolationSolution(savedViolationSolutions, cand, 5);
+        
+        }
         }
     }
 
@@ -224,6 +530,13 @@ for (int generation = 0; generation < maxGenerations; ++generation) {
 
             candidate.fitness.clear();
             evaluateFitness(candidate, parameters, loadingCache);
+            if (!candidate.fitness.empty() &&
+            candidate.fitness[0] < 1e12 &&!candidate.failedTruckRecords.empty() &&candidate.failedTruckRecords.size() <= 2) {
+
+            SavedViolationSolution cand = buildSavedViolationSolution(candidate, 2);
+            tryAddSavedViolationSolution(savedViolationSolutions, cand, 5);
+            
+        }
 
             int viol2 = checkIndividualPlacement(candidate, cargoLookupExploit, false);
 
@@ -372,7 +685,10 @@ for (int area = 1; area <= regionNum; ++area) {
         decodePopulation(one, parameters, cargoLookUp2);
         one[0].fitness.clear();
         evaluateFitness(one[0], parameters, loadingCache);
-
+        printFailedTruckRecordsSummary(
+        one[0].failedTruckRecords,
+        "Violation Records of Re-evaluated globalBest"
+        );
         int viol = checkIndividualPlacement(one[0], cargoLookUp2, true);
         cout << "\n[CHECK] placement violations = " << viol << "\n";
 
@@ -384,7 +700,13 @@ for (int area = 1; area <= regionNum; ++area) {
         }
 
         cout << "\n=== [DEBUG] Customer Summary (globalBest) ===\n";
+        cout << "\n[FINAL] savedViolationSolutions count = "
+        << savedViolationSolutions.size() << "\n";
 
+        exportSavedViolationSolutionsToTxt(
+            savedViolationSolutions,
+            "saved_sol"
+        );
         unordered_map<int,int> custArea;
         unordered_set<int> selfOwnedCust, rentedCust;
 

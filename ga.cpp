@@ -25,6 +25,7 @@ const std::unordered_set<int> TEST_FORCED_SELFOWNED = {};
 
 unordered_set<string> successCache;
 
+
 enum ReduceOp {
     opReinsertion = 0,   // rented -> self
     opConsolidation = 1, // merge rented trucks
@@ -621,7 +622,6 @@ static bool localSearchRotateAllAndTryInsert(
     return false;
 }
 
-
 void evaluateFitness(Individual& indiv,
                      const Data& parameters,
                      LoadingCache& loadingCache) {
@@ -637,20 +637,16 @@ void evaluateFitness(Individual& indiv,
 
     auto cargoLookup = createCargoLookup(parameters);
 
-    long long dbgHit = 0;
-    long long dbgReal = 0;
+    // 每次 evaluate 前清空 violation records
+    indiv.failedTruckRecords.clear();
 
-    // ==============================
-    // init
-    // ==============================
+    // init trucks
     for (int area = 1; area <= regionNum; ++area) {
         selfOwnedTrucks[area] = Truck();
         selfOwnedTrucks[area].truckId = area;
     }
 
-    // ==============================
-    // build regionMap
-    // ==============================
+    // build region map
     for (const auto& g : indiv.chromosome) {
         regionMap[g.decodedServiceArea].push_back(g);
         isLoadedGlobal[g.customerId] = false;
@@ -666,13 +662,14 @@ void evaluateFitness(Individual& indiv,
 
         auto& cargoList = it->second;
 
+        // group by customer
         unordered_map<int, vector<Gene>> customerGrouped;
         for (auto& g : cargoList) {
             customerGrouped[g.customerId].push_back(g);
         }
 
+        // build customer set
         vector<int> customerSet;
-        customerSet.reserve(customerGrouped.size());
         for (auto& kv : customerGrouped) {
             customerSet.push_back(kv.first);
         }
@@ -680,37 +677,51 @@ void evaluateFitness(Individual& indiv,
         sort(customerSet.begin(), customerSet.end());
         customerSet.erase(unique(customerSet.begin(), customerSet.end()), customerSet.end());
 
-        string key = buildSortedCustomerKey(customerSet);
+        string setKey = buildSortedCustomerKey(customerSet);
 
-        // exact cache hit: 整組都成功過
-        if (loadingCache.selfOwnedSuccessCache[area].count(key)) {
-            dbgHit++;
+        // ===== 固定順序 =====
+        vector<int> routeOrder = buildRouteFromFixedOrder(
+            customerSet,
+            parameters,
+            area
+        );
+
+        string orderKey = buildOrderKey(routeOrder);
+
+        // ==========================
+        // cache hit
+        // ==========================
+        if (loadingCache.hasSuccess(area, setKey, orderKey)) {
 
             for (int cid : customerSet) {
                 isLoadedGlobal[cid] = true;
                 selfOwnedTrucks[area].loadedVolume += parameters.totalVolume[cid - 1];
             }
 
-            selfOwnedTrucks[area].route =
-                buildRouteFromFixedOrder(customerSet, parameters, area);
-
+            selfOwnedTrucks[area].route = routeOrder;
             continue;
         }
 
-        dbgReal++;
-
+        // ==========================
+        // real loading
+        // ==========================
         Truck& truck = selfOwnedTrucks[area];
         BLPlacement3D loader(truck.length, truck.width, truck.height);
         loader.setCargoLookup(cargoLookup);
 
         bool allSuccess = true;
         vector<int> loadedCustomers;
+        vector<Gene> loadedCargoSnapshot;
 
-        // 逐 customer 試，fail 不 break
-        for (int custId : customerSet) {
+        for (int idx = 0; idx < (int)routeOrder.size(); ++idx) {
+            int custId = routeOrder[idx];
 
             auto cargoGroup = customerGrouped[custId];
             bool success = false;
+
+            bool hasViolationRecord = false;
+            PlacementViolationInfo bestTrialInfo;
+            vector<Gene> successGroup;
 
             for (int trial = 0; trial < 5 && !success; ++trial) {
                 auto temp = cargoGroup;
@@ -722,6 +733,41 @@ void evaluateFitness(Individual& indiv,
 
                 if (loader.tryInsert(temp, 50)) {
                     success = true;
+                    successGroup = temp;
+                } else {
+                    if (loader.lastViolationInfo.hasFailedPlacement) {
+                        const auto& cur = loader.lastViolationInfo;
+
+                        if (!hasViolationRecord) {
+                            bestTrialInfo = cur;
+                            hasViolationRecord = true;
+                        } else {
+                            bool curBetter = false;
+
+                            if (cur.hasBoundaryZeroButCollision &&
+                                !bestTrialInfo.hasBoundaryZeroButCollision) {
+                                curBetter = true;
+                            }
+                            else if (cur.hasBoundaryZeroButCollision ==
+                                     bestTrialInfo.hasBoundaryZeroButCollision) {
+                                if (cur.bestBoundaryViolation <
+                                    bestTrialInfo.bestBoundaryViolation) {
+                                    curBetter = true;
+                                }
+                                else if (cur.bestBoundaryViolation ==
+                                         bestTrialInfo.bestBoundaryViolation) {
+                                    if (cur.bestTotalOverlap <
+                                        bestTrialInfo.bestTotalOverlap) {
+                                        curBetter = true;
+                                    }
+                                }
+                            }
+
+                            if (curBetter) {
+                                bestTrialInfo = cur;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -729,54 +775,69 @@ void evaluateFitness(Individual& indiv,
                 loadedCustomers.push_back(custId);
                 isLoadedGlobal[custId] = true;
                 truck.loadedVolume += parameters.totalVolume[custId - 1];
+
+                loadedCargoSnapshot.insert(
+                    loadedCargoSnapshot.end(),
+                    successGroup.begin(),
+                    successGroup.end()
+                );
             } else {
                 allSuccess = false;
+
+                if (hasViolationRecord) {
+                    double currentApproxFitness =
+                        outsourcedCost + C1 * selfOwnedFuelCost;
+
+                    // ===== 版本 B：收集 fail 後 remaining customers 的貨 =====
+                    std::vector<Gene> remainingCustomerCargoGroup;
+                    for (int j = idx + 1; j < (int)routeOrder.size(); ++j) {
+                        int futureCid = routeOrder[j];
+                        const auto& futureGroup = customerGrouped[futureCid];
+                        remainingCustomerCargoGroup.insert(
+                            remainingCustomerCargoGroup.end(),
+                            futureGroup.begin(),
+                            futureGroup.end()
+                        );
+                    }
+
+                    BetterButFailedRecord rec = buildBetterButFailedRecord(
+                        area,
+                        truck.truckId,
+                        truck.length,
+                        truck.width,
+                        truck.height,
+                        custId,
+                        currentApproxFitness,
+                        bestTrialInfo,
+                        loadedCargoSnapshot,
+                        cargoGroup,
+                        remainingCustomerCargoGroup,
+                        routeOrder,
+                        idx,
+                        cargoLookup
+                    );
+
+                    tryAddFailedRecord(indiv.failedTruckRecords, rec, 10);
+                }
             }
         }
 
-        sort(loadedCustomers.begin(), loadedCustomers.end());
-        loadedCustomers.erase(unique(loadedCustomers.begin(), loadedCustomers.end()), loadedCustomers.end());
+        // loadedCustomers 是 routeOrder 的成功子序列
+        truck.route = loadedCustomers;
 
-        if (!loadedCustomers.empty()) {
-            truck.route = buildRouteFromFixedOrder(loadedCustomers, parameters, area);
-        } else {
-            truck.route.clear();
-        }
-
-        // 只有整組都成功才 cache
         if (allSuccess) {
-            loadingCache.selfOwnedSuccessCache[area].insert(key);
+            loadingCache.saveSuccess(area, setKey, orderKey);
         }
     }
 
     // ==============================
-    // collect not loaded
+    // outsourced
     // ==============================
     vector<int> notLoaded;
     for (auto& kv : isLoadedGlobal) {
         if (!kv.second) notLoaded.push_back(kv.first);
     }
 
-    // ==============================
-    // self-owned fuel cost
-    // ==============================
-    for (int area = 1; area <= regionNum; ++area) {
-        auto& route = selfOwnedTrucks[area].route;
-        if (route.empty()) continue;
-
-        double dist = 0.0;
-        dist += parameters.getDistance(0, route.front());
-        for (int i = 0; i + 1 < (int)route.size(); ++i) {
-            dist += parameters.getDistance(route[i], route[i + 1]);
-        }
-        dist += parameters.getDistance(route.back(), 0);
-
-        selfOwnedFuelCost += dist;
-    }
-
-    // ==============================
-    // rented cost
-    // ==============================
     for (int cid : notLoaded) {
         double vol = parameters.totalVolume[cid - 1];
         int v = (int)ceil(vol);
@@ -784,17 +845,49 @@ void evaluateFitness(Individual& indiv,
     }
 
     // ==============================
-    // final
+    // distance cost
+    // ==============================
+    for (int area = 1; area <= regionNum; ++area) {
+        auto& route = selfOwnedTrucks[area].route;
+        if (route.empty()) continue;
+
+        double dist = 0.0;
+        dist += parameters.getDistance(0, route.front());
+
+        for (int i = 0; i + 1 < (int)route.size(); ++i) {
+            dist += parameters.getDistance(route[i], route[i + 1]);
+        }
+
+        dist += parameters.getDistance(route.back(), 0);
+
+        selfOwnedFuelCost += dist;
+    }
+
+    // ==============================
+    // final objective
+    // ==============================
+    double obj = outsourcedCost + C1 * selfOwnedFuelCost;
+
+    // 把最後 obj 回填到所有 record
+    for (auto& rec : indiv.failedTruckRecords) {
+        rec.fitnessValue = obj;
+    }
+
+    std::sort(
+        indiv.failedTruckRecords.begin(),
+        indiv.failedTruckRecords.end(),
+        isBetterFailedRecord
+    );
+
+    // ==============================
+    // write back
     // ==============================
     for (int area = 1; area <= regionNum; ++area) {
         indiv.selfOwnedTrucks[area] = selfOwnedTrucks[area];
     }
 
-    double obj = outsourcedCost + C1 * selfOwnedFuelCost;
     indiv.fitness.clear();
     indiv.fitness.push_back(obj);
-
-    cout << "[FAST] hit=" << dbgHit << " real=" << dbgReal << endl;
 }
 vector<Individual> selection(const vector<Individual>& population,
                              const vector<Individual>& decodedPopulation,

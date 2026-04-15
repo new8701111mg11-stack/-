@@ -16,6 +16,183 @@ using namespace std;
 // 處理讀參數相關資料
 const double SCALE = 4.5;          // 改成 1.0, 1.25, 1.5, 1.75, 2.0
 const double LEN_SCALE = cbrt(SCALE);
+
+static bool isCollisionDominantViolation(const PlacementViolationInfo& v) {
+    return
+        v.hasFailedPlacement &&
+        v.bestBoundaryViolation <= 1e-9 &&
+        v.hasBoundaryZeroCandidate &&
+        v.hasBoundaryZeroButCollision &&
+        v.collisionFailCount > 0;
+}
+
+static RecordCargoInfo makeRecordCargoInfo(
+    const Gene& g,
+    const std::unordered_map<int, std::unordered_map<int, Cargo>>& cargoLookup
+) {
+    RecordCargoInfo info;
+    info.customerId = g.customerId;
+    info.cargoId = g.cargoId;
+
+    auto it1 = cargoLookup.find(g.customerId);
+    if (it1 != cargoLookup.end()) {
+        auto it2 = it1->second.find(g.cargoId);
+        if (it2 != it1->second.end()) {
+            const Cargo& c = it2->second;
+            info.l = c.lwh[0];
+            info.w = c.lwh[1];
+            info.h = c.lwh[2];
+            for (int r = 0; r < 6; ++r) {
+                info.orientation[r] = c.orientation[r];
+            }
+        }
+    }
+
+    return info;
+}
+
+static std::vector<RecordCargoInfo> makeRecordCargoInfoList(
+    const std::vector<Gene>& genes,
+    const std::unordered_map<int, std::unordered_map<int, Cargo>>& cargoLookup
+) {
+    std::vector<RecordCargoInfo> out;
+    out.reserve(genes.size());
+    for (const auto& g : genes) {
+        out.push_back(makeRecordCargoInfo(g, cargoLookup));
+    }
+    return out;
+}
+
+static std::vector<int> extractUniqueCustomerList(const std::vector<Gene>& genes) {
+    std::vector<int> out;
+    std::unordered_set<int> seen;
+    for (const auto& g : genes) {
+        if (!seen.count(g.customerId)) {
+            seen.insert(g.customerId);
+            out.push_back(g.customerId);
+        }
+    }
+    return out;
+}
+
+static std::vector<int> mergeCustomerListWithTryingCustomer(
+    const std::vector<int>& loadedCustomerList,
+    int tryingCustomer
+) {
+    std::vector<int> out = loadedCustomerList;
+    bool exists = false;
+    for (int x : out) {
+        if (x == tryingCustomer) {
+            exists = true;
+            break;
+        }
+    }
+    if (!exists) out.push_back(tryingCustomer);
+    return out;
+}
+
+
+static bool isSameTruckCase(
+    const BetterButFailedRecord& a,
+    const BetterButFailedRecord& b
+) {
+    if (a.area != b.area) return false;
+    if (a.truckId != b.truckId) return false;
+    if (a.tryingCustomer != b.tryingCustomer) return false;
+    if (a.truckCaseCustomerList.size() != b.truckCaseCustomerList.size()) return false;
+
+    for (size_t i = 0; i < a.truckCaseCustomerList.size(); ++i) {
+        if (a.truckCaseCustomerList[i] != b.truckCaseCustomerList[i]) return false;
+    }
+    return true;
+}
+
+static bool isBetterFailedRecord(
+    const BetterButFailedRecord& a,
+    const BetterButFailedRecord& b
+) {
+    // 1. 先比 fitness，越小越好
+    if (a.fitnessValue != b.fitnessValue) {
+        return a.fitnessValue < b.fitnessValue;
+    }
+
+    // 2. collision-dominant 優先
+    if (a.collisionDominant != b.collisionDominant) {
+        return a.collisionDominant && !b.collisionDominant;
+    }
+
+    // 3. boundary violation 越小越好
+    if (a.bestBoundaryViolation != b.bestBoundaryViolation) {
+        return a.bestBoundaryViolation < b.bestBoundaryViolation;
+    }
+
+    // 4. overlap 越小越好
+    if (a.bestTotalOverlap != b.bestTotalOverlap) {
+        return a.bestTotalOverlap < b.bestTotalOverlap;
+    }
+
+    // 5. collisionFailCount 越小越好
+    if (a.collisionFailCount != b.collisionFailCount) {
+        return a.collisionFailCount < b.collisionFailCount;
+    }
+
+    // 6. candidateCount 越小越好
+    return a.candidateCount < b.candidateCount;
+}
+
+static void tryAddFailedRecord(
+    std::vector<BetterButFailedRecord>& pool,
+    const BetterButFailedRecord& rec,
+    size_t maxKeep = 10
+) {
+    // 先做同類 case 去重：若同 case 已存在，只保留更好的那筆
+    for (auto& oldRec : pool) {
+        if (isSameTruckCase(oldRec, rec)) {
+            if (isBetterFailedRecord(rec, oldRec)) {
+                oldRec = rec;
+            }
+            return;
+        }
+    }
+
+    pool.push_back(rec);
+
+    std::sort(pool.begin(), pool.end(), isBetterFailedRecord);
+
+    if (pool.size() > maxKeep) {
+        pool.resize(maxKeep);
+    }
+}
+
+double BLPlacement3D::computeBoundaryViolation(
+    const Box& box,
+    double& overflowX,
+    double& overflowY,
+    double& overflowZ
+) {
+    overflowX = std::max(0.0, double(box.x + box.l - containerL));
+    overflowY = std::max(0.0, double(box.y + box.w - containerW));
+    overflowZ = std::max(0.0, double(box.z + box.h - containerH));
+
+    return overflowX + overflowY + overflowZ;
+}
+double BLPlacement3D::computeTotalOverlapVolume(
+    const Box& b,
+    const vector<Box>& boxes
+) {
+    double totalOverlap = 0.0;
+
+    for (const auto& p : boxes) {
+        int overlapX = max(0, min(b.x + b.l, p.x + p.l) - max(b.x, p.x));
+        int overlapY = max(0, min(b.y + b.w, p.y + p.w) - max(b.y, p.y));
+        int overlapZ = max(0, min(b.z + b.h, p.z + p.h) - max(b.z, p.z));
+
+        totalOverlap += 1.0 * overlapX * overlapY * overlapZ;
+    }
+
+    return totalOverlap;
+}
+
 void readGoodsCSV(const string& filename, Data& data) {
     ifstream file(filename);
     if (!file.is_open()) {
@@ -218,6 +395,8 @@ void BLPlacement3D::setCargoLookup(const unordered_map<int, unordered_map<int, C
 bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
     static std::mt19937 rng(std::random_device{}());
 
+    resetViolationInfo();
+
     auto tryOneOrder = [&](std::vector<Gene> cand) -> bool {
         std::vector<Box> tempPlaced = placedBoxes;
 
@@ -231,19 +410,75 @@ bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
             bool placed = false;
             Box placedBox;
 
+            PlacementViolationInfo bestFailInfo;
+            bool hasBestFailInfo = false;
+
             for (int k = 0; k < 6; ++k) {
                 g.undecodedRotation = rotList[k];
                 g.decodedRotation = rotList[k];
 
                 Box b = getBoxFromGene(g);
+
                 if (placeBox(b, tempPlaced)) {
                     placed = true;
                     placedBox = b;
                     break;
+                } else {
+                    PlacementViolationInfo cur;
+                    cur.hasFailedPlacement = true;
+                    cur.failedCustomerId = g.customerId;
+                    cur.failedCargoId = g.cargoId;
+
+                    cur.bestBoundaryViolation = lastPlaceBoxSummary.bestBoundaryViolation;
+                    cur.overflowX = lastPlaceBoxSummary.bestOverflowX;
+                    cur.overflowY = lastPlaceBoxSummary.bestOverflowY;
+                    cur.overflowZ = lastPlaceBoxSummary.bestOverflowZ;
+
+                    cur.candidateCount = lastPlaceBoxSummary.candidateCount;
+                    cur.boundaryFailCount = lastPlaceBoxSummary.boundaryFailCount;
+                    cur.collisionFailCount = lastPlaceBoxSummary.collisionFailCount;
+                    cur.hasBoundaryZeroCandidate = lastPlaceBoxSummary.hasBoundaryZeroCandidate;
+                    cur.hasBoundaryZeroButCollision = lastPlaceBoxSummary.hasBoundaryZeroButCollision;
+                    cur.bestTotalOverlap = lastPlaceBoxSummary.bestTotalOverlap;
+
+                    if (!hasBestFailInfo) {
+                        bestFailInfo = cur;
+                        hasBestFailInfo = true;
+                    } else {
+                        bool curBetter = false;
+
+                        // 規則 1：優先記錄「沒超界但撞到」的 case
+                        if (cur.hasBoundaryZeroButCollision && !bestFailInfo.hasBoundaryZeroButCollision) {
+                            curBetter = true;
+                        }
+                        else if (cur.hasBoundaryZeroButCollision == bestFailInfo.hasBoundaryZeroButCollision) {
+                            // 規則 2：boundary violation 較小者優先
+                            if (cur.bestBoundaryViolation < bestFailInfo.bestBoundaryViolation) {
+                                curBetter = true;
+                            }
+                            else if (cur.bestBoundaryViolation == bestFailInfo.bestBoundaryViolation) {
+                                // 規則 3：overlap 較小者優先
+                                if (cur.bestTotalOverlap < bestFailInfo.bestTotalOverlap) {
+                                    curBetter = true;
+                                }
+                            }
+                        }
+
+                        if (curBetter) {
+                            bestFailInfo = cur;
+                        }
+                    }
                 }
             }
 
             if (!placed) {
+                if (hasBestFailInfo) {
+                    lastViolationInfo = bestFailInfo;
+                } else {
+                    lastViolationInfo.hasFailedPlacement = true;
+                    lastViolationInfo.failedCustomerId = g.customerId;
+                    lastViolationInfo.failedCargoId = g.cargoId;
+                }
                 return false;
             }
 
@@ -291,8 +526,9 @@ bool BLPlacement3D::tryInsert(std::vector<Gene>& group, int maxTries) {
 
     return false;
 }
-
 bool BLPlacement3D::placeBox(Box& box, const vector<Box>& currentBoxes) {
+    resetPlaceBoxSummary();
+
     vector<tuple<int, int, int>> anchorPoints;
     anchorPoints.reserve(1 + 3 * currentBoxes.size());
     anchorPoints.push_back({0, 0, 0});
@@ -317,14 +553,57 @@ bool BLPlacement3D::placeBox(Box& box, const vector<Box>& currentBoxes) {
         box.y = ay;
         box.z = az;
 
-        if (isWithinContainer(box) && !hasCollision(box, currentBoxes)) {
+        lastPlaceBoxSummary.candidateCount++;
+
+        double ox = 0.0, oy = 0.0, oz = 0.0;
+        double boundaryV = computeBoundaryViolation(box, ox, oy, oz);
+
+        bool within = isWithinContainer(box);
+        bool collision = false;
+        double overlapV = 0.0;
+
+        if (within) {
+            lastPlaceBoxSummary.hasBoundaryZeroCandidate = true;
+            collision = hasCollision(box, currentBoxes);
+
+            if (collision) {
+                lastPlaceBoxSummary.hasBoundaryZeroButCollision = true;
+                lastPlaceBoxSummary.collisionFailCount++;
+
+                overlapV = computeTotalOverlapVolume(box, currentBoxes);
+                if (overlapV < lastPlaceBoxSummary.bestTotalOverlap) {
+                    lastPlaceBoxSummary.bestTotalOverlap = overlapV;
+                }
+            }
+        } else {
+            lastPlaceBoxSummary.boundaryFailCount++;
+        }
+
+        if (boundaryV < lastPlaceBoxSummary.bestBoundaryViolation) {
+            lastPlaceBoxSummary.bestBoundaryViolation = boundaryV;
+            lastPlaceBoxSummary.bestOverflowX = ox;
+            lastPlaceBoxSummary.bestOverflowY = oy;
+            lastPlaceBoxSummary.bestOverflowZ = oz;
+        }
+
+        if (within && !collision) {
             return true;
         }
     }
 
+    if (lastPlaceBoxSummary.bestBoundaryViolation == 1e18) {
+        lastPlaceBoxSummary.bestBoundaryViolation = 0.0;
+        lastPlaceBoxSummary.bestOverflowX = 0.0;
+        lastPlaceBoxSummary.bestOverflowY = 0.0;
+        lastPlaceBoxSummary.bestOverflowZ = 0.0;
+    }
+
+    if (lastPlaceBoxSummary.bestTotalOverlap == 1e18) {
+        lastPlaceBoxSummary.bestTotalOverlap = 0.0;
+    }
+
     return false;
 }
-
 bool BLPlacement3D::isWithinContainer(const Box& b) {
     return b.x >= 0 && b.y >= 0 && b.z >= 0 &&
            b.x + b.l <= containerL &&
@@ -424,6 +703,103 @@ inline std::string buildSetKey(std::vector<int> customers) {
     return key;
 }
 
+
+inline std::string buildOrderKey(const std::vector<int>& route) {
+    std::string key;
+    for (size_t i = 0; i < route.size(); ++i) {
+        if (i) key += "-";
+        key += std::to_string(route[i]);
+    }
+    return key;
+}
+
+static double getTotalOverlapScore(const SavedViolationSolution& s) {
+    double sum = 0.0;
+    for (const auto& r : s.failedRecords) {
+        sum += r.bestTotalOverlap;
+    }
+    return sum;
+}
+
+static bool isBetterSavedViolationSolution(
+    const SavedViolationSolution& a,
+    const SavedViolationSolution& b
+) {
+    if (a.fitnessValue != b.fitnessValue) {
+        return a.fitnessValue < b.fitnessValue;
+    }
+
+    if (a.failTruckCount != b.failTruckCount) {
+        return a.failTruckCount < b.failTruckCount;
+    }
+
+    return getTotalOverlapScore(a) < getTotalOverlapScore(b);
+}
+
+static SavedViolationSolution buildSavedViolationSolution(
+    const Individual& indiv,
+    size_t maxCasesPerSolution = 2
+) {
+    SavedViolationSolution s;
+    s.fitnessValue = (!indiv.fitness.empty() ? indiv.fitness[0] : 1e18);
+
+    size_t takeN = std::min(maxCasesPerSolution, indiv.failedTruckRecords.size());
+    s.failedRecords.assign(
+        indiv.failedTruckRecords.begin(),
+        indiv.failedTruckRecords.begin() + takeN
+    );
+
+    s.failTruckCount = (int)s.failedRecords.size();
+    return s;
+}
+
+
+
+
+static bool isSameSavedViolationSolution(
+    const SavedViolationSolution& a,
+    const SavedViolationSolution& b
+) {
+    if (a.failTruckCount != b.failTruckCount) return false;
+    if (a.failedRecords.size() != b.failedRecords.size()) return false;
+
+    for (size_t i = 0; i < a.failedRecords.size(); ++i) {
+        const auto& ra = a.failedRecords[i];
+        const auto& rb = b.failedRecords[i];
+
+        if (ra.area != rb.area) return false;
+        if (ra.truckId != rb.truckId) return false;
+        if (ra.tryingCustomer != rb.tryingCustomer) return false;
+        if (ra.truckCaseCustomerList != rb.truckCaseCustomerList) return false;
+    }
+    return true;
+}
+
+static void tryAddSavedViolationSolution(
+    std::vector<SavedViolationSolution>& pool,
+    const SavedViolationSolution& cand,
+    size_t maxKeep = 5
+) {
+    if (cand.failedRecords.empty()) return;
+
+    for (auto& oldSol : pool) {
+        if (isSameSavedViolationSolution(oldSol, cand)) {
+            if (isBetterSavedViolationSolution(cand, oldSol)) {
+                oldSol = cand;
+            }
+            return;
+        }
+    }
+
+    pool.push_back(cand);
+
+    std::sort(pool.begin(), pool.end(), isBetterSavedViolationSolution);
+
+    if (pool.size() > maxKeep) {
+        pool.resize(maxKeep);
+    }
+}
+
 static string buildSortedCustomerKey(vector<int> customerSet) {
     sort(customerSet.begin(), customerSet.end());
     customerSet.erase(unique(customerSet.begin(), customerSet.end()), customerSet.end());
@@ -435,6 +811,7 @@ static string buildSortedCustomerKey(vector<int> customerSet) {
     }
     return key;
 }
+
 static vector<int> buildRouteFromFixedOrder(
     const vector<int>& customerSet,
     const Data& parameters,
@@ -443,7 +820,6 @@ static vector<int> buildRouteFromFixedOrder(
     vector<int> route;
     unordered_set<int> inSet(customerSet.begin(), customerSet.end());
 
-    // 假設 parameters.route 是 0-based: route[0], route[1], ...
     const auto& baseRoute = parameters.route[area - 1];
 
     for (int cid : baseRoute) {
@@ -452,10 +828,96 @@ static vector<int> buildRouteFromFixedOrder(
         }
     }
 
-    // fallback：如果 base route 沒有完整涵蓋 customerSet
     if (route.size() != customerSet.size()) {
         route = customerSet;
     }
 
     return route;
+}
+
+
+
+static BetterButFailedRecord buildBetterButFailedRecord(
+    int area,
+    int truckId,
+    int containerL,
+    int containerW,
+    int containerH,
+    int tryingCustomer,
+    double fitnessValue,
+    const PlacementViolationInfo& v,
+    const std::vector<Gene>& loadedCargoSnapshot,
+    const std::vector<Gene>& tryingCustomerCargoGroup,
+    const std::vector<Gene>& remainingCustomerCargoGroup,
+    const std::vector<int>& routeOrder,
+    int failIndex,
+    const std::unordered_map<int, std::unordered_map<int, Cargo>>& cargoLookup
+) {
+    BetterButFailedRecord rec;
+
+    rec.fitnessValue = fitnessValue;
+
+    rec.area = area;
+    rec.truckId = truckId;
+
+    rec.tryingCustomer = tryingCustomer;
+    rec.failedCustomer = v.failedCustomerId;
+    rec.failedCargo = v.failedCargoId;
+
+    rec.candidateCount = v.candidateCount;
+    rec.boundaryFailCount = v.boundaryFailCount;
+    rec.collisionFailCount = v.collisionFailCount;
+
+    rec.hasBoundaryZeroCandidate = v.hasBoundaryZeroCandidate;
+    rec.hasBoundaryZeroButCollision = v.hasBoundaryZeroButCollision;
+    rec.collisionDominant = isCollisionDominantViolation(v);
+
+    rec.bestBoundaryViolation = v.bestBoundaryViolation;
+    rec.overflowX = v.overflowX;
+    rec.overflowY = v.overflowY;
+    rec.overflowZ = v.overflowZ;
+    rec.bestTotalOverlap = v.bestTotalOverlap;
+
+    rec.containerL = containerL;
+    rec.containerW = containerW;
+    rec.containerH = containerH;
+
+    // local rescue case
+    rec.loadedCustomerList = extractUniqueCustomerList(loadedCargoSnapshot);
+    rec.truckCaseCustomerList = mergeCustomerListWithTryingCustomer(
+        rec.loadedCustomerList,
+        tryingCustomer
+    );
+
+    // full planned route info
+    rec.fullPlannedCustomerList = routeOrder;
+    rec.failIndexInPlannedRoute = failIndex;
+
+    rec.remainingCustomerListAfterFail.clear();
+    for (int i = failIndex + 1; i < (int)routeOrder.size(); ++i) {
+        rec.remainingCustomerListAfterFail.push_back(routeOrder[i]);
+    }
+
+    // cargo info
+    rec.baseLoadedCargoes = makeRecordCargoInfoList(loadedCargoSnapshot, cargoLookup);
+    rec.tryingCustomerCargoes = makeRecordCargoInfoList(tryingCustomerCargoGroup, cargoLookup);
+    rec.remainingCustomerCargoes = makeRecordCargoInfoList(remainingCustomerCargoGroup, cargoLookup);
+
+    // local case = loaded + trying
+    rec.allCargoesForTruckCase = rec.baseLoadedCargoes;
+    rec.allCargoesForTruckCase.insert(
+        rec.allCargoesForTruckCase.end(),
+        rec.tryingCustomerCargoes.begin(),
+        rec.tryingCustomerCargoes.end()
+    );
+
+    // full case = loaded + trying + remaining
+    rec.fullPlannedCargoes = rec.allCargoesForTruckCase;
+    rec.fullPlannedCargoes.insert(
+        rec.fullPlannedCargoes.end(),
+        rec.remainingCustomerCargoes.begin(),
+        rec.remainingCustomerCargoes.end()
+    );
+
+    return rec;
 }
