@@ -419,12 +419,237 @@ static void exportSavedViolationSolutionsToTxt(
         }
     }
 }
+
+void checkSolutionCacheStatus(
+    const std::vector<std::vector<int>>& customersByArea,
+    const Data& parameters,
+    const LoadingCache& loadingCache,
+    const std::string& title
+) {
+    std::cout << "\n===== " << title << " =====\n";
+
+    for (int area = 1; area <= regionNum; ++area) {
+        const auto& customers = customersByArea[area];
+
+        if (customers.empty()) {
+            std::cout << "Area " << area << ": empty\n";
+            continue;
+        }
+
+        std::vector<int> sortedCustomers = customers;
+        std::string setKey = buildSetKey(sortedCustomers);
+
+        std::vector<int> routeOrder = buildRouteFromFixedOrder(
+            sortedCustomers,
+            parameters,
+            area
+        );
+        std::string orderKey = buildOrderKey(routeOrder);
+
+        bool seen = loadingCache.hasSeen(area, setKey, orderKey);
+        bool success = loadingCache.hasSuccess(area, setKey, orderKey);
+
+        std::cout << "Area " << area << "\n";
+
+        std::cout << "  customers  = ";
+        for (int i = 0; i < (int)sortedCustomers.size(); ++i) {
+            if (i) std::cout << "-";
+            std::cout << sortedCustomers[i];
+        }
+        std::cout << "\n";
+
+        std::cout << "  routeOrder = ";
+        for (int i = 0; i < (int)routeOrder.size(); ++i) {
+            if (i) std::cout << "-";
+            std::cout << routeOrder[i];
+        }
+        std::cout << "\n";
+
+        std::cout << "  setKey     = " << setKey << "\n";
+        std::cout << "  orderKey   = " << orderKey << "\n";
+        std::cout << "  seen       = " << (seen ? "YES" : "NO") << "\n";
+        std::cout << "  success    = " << (success ? "YES" : "NO") << "\n";
+
+        if (!seen && !success) {
+            std::cout << "  => never appeared in GA\n";
+        } else if (seen && !success) {
+            std::cout << "  => appeared in GA, but never succeeded\n";
+        } else if (seen && success) {
+            std::cout << "  => appeared in GA, and succeeded before\n";
+        }
+
+        std::cout << "\n";
+    }
+}
+
+static void printFinalBestSummary(const Individual& indiv, const Data& parameters) {
+    std::cout << "\n==============================\n";
+    std::cout << "===== Global Best Feasible Solution =====\n";
+    std::cout << "Best feasible cost = " << indiv.fitness[0] << "\n\n";
+
+    // Self-owned trucks
+    for (int area = 1; area <= regionNum; ++area) {
+        const auto& truck = indiv.selfOwnedTrucks[area];
+
+        std::cout << "Self-owned Truck (Area " << area << ") route: ";
+        if (truck.route.empty()) {
+            std::cout << "(empty)";
+        } else {
+            for (int i = 0; i < (int)truck.route.size(); ++i) {
+                std::cout << truck.route[i];
+                if (i + 1 < (int)truck.route.size()) std::cout << " -> ";
+            }
+        }
+        std::cout << "\n";
+
+        if (!truck.assignedCargo.empty()) {
+            std::cout << "Truck " << area << " cargos:\n";
+            for (const auto& g : truck.assignedCargo) {
+                std::cout << "  Customer: " << g.customerId
+                          << " CargoID: " << g.cargoId
+                          << " Position: ("
+                          << g.position[0] << ", "
+                          << g.position[1] << ", "
+                          << g.position[2] << ")"
+                          << " Rotation: " << g.decodedRotation
+                          << "\n";
+            }
+        } else {
+            std::cout << "Truck " << area << " cargos: (empty)\n";
+        }
+
+        std::cout << "\n";
+    }
+
+    // Rented trucks
+    if (indiv.rentedTrucks.empty()) {
+        std::cout << "Rented trucks: none\n";
+    } else {
+        for (int r = 0; r < (int)indiv.rentedTrucks.size(); ++r) {
+            const auto& truck = indiv.rentedTrucks[r];
+            std::cout << "Rented Truck " << r << " cargos:\n";
+            for (const auto& g : truck.assignedCargo) {
+                std::cout << "  Customer: " << g.customerId
+                          << " CargoID: " << g.cargoId
+                          << " Position: ("
+                          << g.position[0] << ", "
+                          << g.position[1] << ", "
+                          << g.position[2] << ")"
+                          << " Rotation: " << g.decodedRotation
+                          << "\n";
+            }
+        }
+    }
+
+    // Customer summary
+    std::cout << "\n=== [DEBUG] Customer Summary (globalBest) ===\n";
+    for (int cid = 1; cid <= Customer; ++cid) {
+        bool inSelf = false;
+        bool inRented = false;
+        int selfArea = -1;
+
+        for (int area = 1; area <= regionNum; ++area) {
+            for (const auto& g : indiv.selfOwnedTrucks[area].assignedCargo) {
+                if (g.customerId == cid) {
+                    inSelf = true;
+                    selfArea = area;
+                    break;
+                }
+            }
+            if (inSelf) break;
+        }
+
+        for (const auto& rt : indiv.rentedTrucks) {
+            for (const auto& g : rt.assignedCargo) {
+                if (g.customerId == cid) {
+                    inRented = true;
+                    break;
+                }
+            }
+            if (inRented) break;
+        }
+
+        std::cout << "cust " << cid
+                  << " | decoded=" << indiv.chromosome[cid - 1].decodedServiceArea
+                  << " | selfOwned=" << (inSelf ? "Y" : "N")
+                  << " | rented=" << (inRented ? "Y" : "N")
+                  << " | selfArea=" << selfArea
+                  << " | totalVol=" << parameters.totalVolume[cid - 1]
+                  << "\n";
+    }
+
+    // Outsourcing compare table
+    std::cout << "\n=== [DEBUG] Outsourcing Compare Table (GA side) ===\n";
+    for (int cid = 1; cid <= Customer; ++cid) {
+        bool inSelf = false;
+        bool inRented = false;
+
+        for (int area = 1; area <= regionNum; ++area) {
+            for (const auto& g : indiv.selfOwnedTrucks[area].assignedCargo) {
+                if (g.customerId == cid) {
+                    inSelf = true;
+                    break;
+                }
+            }
+            if (inSelf) break;
+        }
+
+        for (const auto& rt : indiv.rentedTrucks) {
+            for (const auto& g : rt.assignedCargo) {
+                if (g.customerId == cid) {
+                    inRented = true;
+                    break;
+                }
+            }
+            if (inRented) break;
+        }
+
+        double vol = parameters.totalVolume[cid - 1];
+        int ceilVol = (int)std::ceil(vol);
+        double fee = 100 + 30 * std::max(0, ceilVol - 3);
+
+        std::cout << "cust " << cid
+                  << " | totalVol=" << vol
+                  << " | ceil=" << ceilVol
+                  << " | fee=" << fee
+                  << " | self=" << (inSelf ? "Y" : "N")
+                  << " | rented=" << (inRented ? "Y" : "N")
+                  << "\n";
+    }
+
+    std::cout << "==============================\n";
+}
+
+void forceTargetAreasForGurobiLikeTest(Individual& indiv) {
+    // target:
+    // area 1: 6,12
+    // area 2: 5,7,10
+    // area 3: 3,4,8,9
+    // area 4: 1,2,11
+
+    for (auto& g : indiv.chromosome) {
+        int cid = g.customerId;
+
+        if (cid == 6 || cid == 12) {
+            g.decodedServiceArea = 1;
+        }
+        else if (cid == 5 || cid == 7 || cid == 10) {
+            g.decodedServiceArea = 2;
+        }
+        else if (cid == 3 || cid == 4 || cid == 8 || cid == 9) {
+            g.decodedServiceArea = 3;
+        }
+        else if (cid == 1 || cid == 2 || cid == 11) {
+            g.decodedServiceArea = 4;
+        }
+    }
+}
 int main(){
     using Clock = std::chrono::high_resolution_clock;
     auto t_start = Clock::now();
     srand(time(NULL));
     int noImproveCount = 0;
-    const int patience = 3500;
+    const int patience =500;
     double C0 = 6;
     int noImproveObj1Count = 0;
     
@@ -587,6 +812,7 @@ for (int generation = 0; generation < maxGenerations; ++generation) {
     if (hasGlobalBest) {
         cout << "\n===== Global Best Feasible Solution =====\n";
 cout << "Best feasible cost = " << globalBest.fitness[0] << '\n';
+        printFinalBestSummary(globalBest, parameters);
         for (int i = 1; i <= regionNum; ++i) {
             const Truck& truck = globalBest.selfOwnedTrucks[i];
             cout << "\nSelf-owned Truck (Area " << i << ") route: ";
@@ -602,6 +828,21 @@ cout << "Best feasible cost = " << globalBest.fitness[0] << '\n';
                 cout << '\n';
             }
         }
+
+        
+std::vector<std::vector<int>> targetCustomersByArea(regionNum + 1);
+targetCustomersByArea[1] = {6, 12};
+targetCustomersByArea[2] = {5, 7, 10};
+targetCustomersByArea[3] = {3, 4, 8, 9};
+targetCustomersByArea[4] = {1, 2, 11};
+
+checkSolutionCacheStatus(
+    targetCustomersByArea,
+    parameters,
+    loadingCache,
+    "CHECK TARGET SOLUTION CACHE STATUS"
+);
+
 
 // ⭐ FULL packing 多跑幾次，挑最好的穩定結果
 {
@@ -619,7 +860,7 @@ cout << "Best feasible cost = " << globalBest.fitness[0] << '\n';
         globalBest = rebuilt;
     }
 }
-
+printFinalBestSummary(globalBest, parameters);
 cout << "\n===== GA BEST FIXED COST =====\n";
 
 double distSum = 0.0;
@@ -767,6 +1008,40 @@ for (int area = 1; area <= regionNum; ++area) {
     double total_sec = std::chrono::duration<double>(t_end - t_start).count();
     cout << "\nTotal runtime: " << total_sec << " seconds\n";
 
+
+    {
+    std::cout << "\n==============================\n";
+    std::cout << "TEST: Force GA to Gurobi-like area assignment\n";
+    std::cout << "==============================\n";
+
+    Individual test = globalBest;   // 或你想測的某個 individual
+    LoadingCache tempCache;
+    tempCache.clear();
+
+    forceTargetAreasForGurobiLikeTest(test);
+
+    test.fitness.clear();
+    evaluateFitness(test, parameters, tempCache);
+
+    std::cout << "Forced test fitness = " << test.fitness[0] << "\n";
+
+    for (int area = 1; area <= regionNum; ++area) {
+        std::cout << "Area " << area << " route: ";
+        for (int i = 0; i < (int)test.selfOwnedTrucks[area].route.size(); ++i) {
+            std::cout << test.selfOwnedTrucks[area].route[i];
+            if (i + 1 < (int)test.selfOwnedTrucks[area].route.size()) std::cout << " -> ";
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << "Rented customers: ";
+    for (const auto& rt : test.rentedTrucks) {
+        if (!rt.assignedCargo.empty()) {
+            std::cout << rt.assignedCargo.front().customerId << " ";
+        }
+    }
+    std::cout << "\n";
+}
     
 
     return 0;

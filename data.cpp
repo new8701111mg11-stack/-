@@ -140,10 +140,10 @@ static bool isBetterFailedRecord(
     return a.candidateCount < b.candidateCount;
 }
 
-static void tryAddFailedRecord(
+void tryAddFailedRecord(
     std::vector<BetterButFailedRecord>& pool,
     const BetterButFailedRecord& rec,
-    size_t maxKeep = 10
+    size_t maxKeep
 ) {
     // 先做同類 case 去重：若同 case 已存在，只保留更好的那筆
     for (auto& oldRec : pool) {

@@ -98,13 +98,13 @@ model = Model("ChainOsr")
 Z = 4    # 區域數量
 N = 12  # 客戶數量
 N0 = 49 # 節點數量(包含倉庫和客戶節點)
-SCALE = 1
+SCALE = 4.5
 O = 6   # 旋轉方向
 L, W, H = 300,170,165  #貨櫃長寬高
 M = 1e6  # 極大值
 C0 = 6   #每單位才積委外的費用
 C1 = 5.41
-P0 = 1000
+P0 = 0
 vi = {}  #客戶 i 所有貨物的總才積
 vit = {} #客戶 i 的第 t 件貨物的才積
 
@@ -365,7 +365,7 @@ outsourceFee = {}
 for i in range(1, N + 1):
     vol = vi[i]              # 客戶 i 的總才積
     v = math.ceil(vol)       # 不到 1 才以 1 才計
-    outsourceFee[i] = 100 + 30 * max(0, v - 1)
+    outsourceFee[i] = 100 + 30 * max(0, v - 3)
 #目標式
 obj1 = quicksum(outsourceFee[i] * omega[i] for i in range(1, N+1))   # 第一層目標（較重要）
 obj1 += quicksum(
@@ -525,6 +525,7 @@ for i in range(1, N+1):
                     )
 
 #5B
+#5B
 for i in range(1, N+1):  
     for j in range(1, N+1):  
         if i != j:
@@ -532,6 +533,25 @@ for i in range(1, N+1):
                 for tprime in range(1, Gi[j] + 1):
                     model.addConstr(
                         xprime[j, tprime, i, t] + yprime[i, t, j, tprime] + yprime[j, tprime, i, t] + zprime[j, tprime, i, t] >= gamma[i, j],
+                    )
+
+# 5B2: adjacency-only, slightly softer
+for i in range(1, N + 1):
+    for j in range(1, N + 1):
+        if i != j:
+            adj_ij = quicksum(
+                psi[i, j, b]
+                for b in Ab
+                if (i, j) in Ab[b]
+            )
+
+            for t in range(1, Gi[i] + 1):
+                for tprime in range(1, Gi[j] + 1):
+                    model.addConstr(
+                        xprime[j, tprime, i, t]
+                        + yprime[j, tprime, i, t]
+                        >= adj_ij,
+                        name=f"5B2_adj_xy[{i},{t},{j},{tprime}]"
                     )
 
 #5C
@@ -624,7 +644,6 @@ for b in range(1, Z+1):
                 model.addConstr(
                     kappa[j,b] >= kappa[i,b] + gamma[i,j] + delta[i,b] + delta[j,b] - 3
                 )
-
 
 
 model.optimize()

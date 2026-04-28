@@ -56,14 +56,36 @@ struct LoadingCache {
     // area -> setKey -> orderKey 成功
     std::vector<std::unordered_map<std::string, std::unordered_set<std::string>>> selfOwnedSuccessCache;
 
+    // area -> setKey -> orderKey 曾出現
+    std::vector<std::unordered_map<std::string, std::unordered_set<std::string>>> selfOwnedSeenCache;
+
     LoadingCache() {
         selfOwnedSuccessCache.resize(regionNum + 1);
+        selfOwnedSeenCache.resize(regionNum + 1);
     }
 
     void clear() {
         for (auto& mp : selfOwnedSuccessCache) {
             mp.clear();
         }
+        for (auto& mp : selfOwnedSeenCache) {
+            mp.clear();
+        }
+    }
+
+    bool hasSeen(int area, const std::string& setKey, const std::string& orderKey) const {
+        if (area < 1 || area > regionNum) return false;
+
+        const auto& mp = selfOwnedSeenCache[area];
+        auto it = mp.find(setKey);
+        if (it == mp.end()) return false;
+
+        return it->second.count(orderKey) > 0;
+    }
+
+    void saveSeen(int area, const std::string& setKey, const std::string& orderKey) {
+        if (area < 1 || area > regionNum) return;
+        selfOwnedSeenCache[area][setKey].insert(orderKey);
     }
 
     bool hasSuccess(int area, const std::string& setKey, const std::string& orderKey) const {
@@ -274,7 +296,7 @@ public:
 
     void setCargoLookup(const unordered_map<int, unordered_map<int, Cargo>>& lookup);
     bool tryInsert(vector<Gene>& group, int maxTries);
-
+   
     void resetViolationInfo() {
         lastViolationInfo = PlacementViolationInfo{};
     }
@@ -319,4 +341,46 @@ void readParameters(const string& customerInfo, const string& goods, const strin
 void printData(const Data& data);
 void printChromosomeInfo(const Individual& indiv);
 
+std::string buildSetKey(std::vector<int> customers);
+std::string buildOrderKey(const std::vector<int>& route);
+
+std::vector<int> buildRouteFromFixedOrder(
+    const std::vector<int>& customerSet,
+    const Data& parameters,
+    int area
+);
+ 
+void tryAddFailedRecord(
+    std::vector<BetterButFailedRecord>& pool,
+    const BetterButFailedRecord& rec,
+    size_t maxKeep = 10
+);
+BetterButFailedRecord buildBetterButFailedRecord(
+    int area,
+    int truckId,
+    int truckLength,
+    int truckWidth,
+    int truckHeight,
+    int failedCustomer,
+    double currentApproxFitness,
+    const PlacementViolationInfo& bestTrialInfo,
+    const std::vector<Gene>& loadedCargoSnapshot,
+    const std::vector<Gene>& failedCargoGroup,
+    const std::vector<Gene>& remainingCustomerCargoGroup,
+    const std::vector<int>& routeOrder,
+    int failIndex,
+    const std::unordered_map<int, std::unordered_map<int, Cargo>>& cargoLookup
+);
+
+struct OperatorStats {
+    int selectedCount = 0;
+    int returnedTrueCount = 0;
+    int acceptedCount = 0;
+    double totalImprovement = 0.0;
+    double bestImprovement = 0.0;
+};
+bool isBetterFailedRecord(
+    const BetterButFailedRecord& a,
+    const BetterButFailedRecord& b
+);
 #endif
