@@ -25,7 +25,23 @@ const std::unordered_set<int> TEST_FORCED_SELFOWNED = {};
 
 unordered_set<string> successCache;
 
+static bool isLargeViolationForSkip(
+    const PlacementViolationInfo& info,
+    double boundaryLimit,
+    double overlapLimit)
+{
+    if (!info.hasFailedPlacement) return false;
 
+    if (info.bestBoundaryViolation > boundaryLimit) {
+        return true;
+    }
+
+    if (info.bestTotalOverlap > overlapLimit) {
+        return true;
+    }
+
+    return false;
+}
 enum ReduceOp {
     opReinsertion = 0,   // rented -> self
     opConsolidation = 1, // merge rented trucks
@@ -553,11 +569,18 @@ static bool localSearchRotateAllAndTryInsert(
     group = std::move(bestGroup);
     return false;
 }
+
 void evaluateFitness(Individual& indiv,
                      const Data& parameters,
                      LoadingCache& loadingCache) {
 
     const double C1 = 5.41;
+
+    // large violation skip threshold
+    // 第一版先設保守一點，避免誤殺。
+    // 之後可以根據 log 調整。
+    const double LARGE_BOUNDARY_LIMIT = 100.0;
+    const double LARGE_OVERLAP_LIMIT = 100000.0;
 
     double outsourcedCost = 0.0;
     double selfOwnedFuelCost = 0.0;
@@ -653,6 +676,22 @@ void evaluateFitness(Individual& indiv,
             auto cargoGroup = customerGrouped[custId];
             bool success = false;
 
+            // ============================================================
+            // NEW: large violation skip
+            // 如果同一個 area + setKey + orderKey + tryingCustomer
+            // 曾經出現 large violation，這次不再做 3D loading。
+            //
+            // 注意：這只跳過「這個 customer 在這個 area 組合」，
+            // 不代表這個 customer 在其他 area 不能再試。
+            // ============================================================
+            if (loadingCache.hasLargeViolation(area, setKey, orderKey, custId)) {
+                allSuccess = false;
+
+                // 這裡不建立 failedTruckRecord，因為這次沒有真的執行 loading，
+                // 只是根據 cache 判定這個 area combination 不值得重試。
+                continue;
+            }
+
             bool hasViolationRecord = false;
             PlacementViolationInfo bestTrialInfo;
             std::vector<Gene> successGroup;
@@ -727,6 +766,25 @@ void evaluateFitness(Individual& indiv,
                 allSuccess = false;
 
                 if (hasViolationRecord) {
+
+                    // ============================================================
+                    // NEW: save large violation
+                    // 若這次失敗的 violation 明顯過大，
+                    // 則記錄到 loadingCache，之後遇到同樣 area 組合可跳過。
+                    // ============================================================
+                    if (isLargeViolationForSkip(
+                            bestTrialInfo,
+                            LARGE_BOUNDARY_LIMIT,
+                            LARGE_OVERLAP_LIMIT)) {
+
+                        loadingCache.saveLargeViolation(
+                            area,
+                            setKey,
+                            orderKey,
+                            custId
+                        );
+                    }
+
                     double currentApproxFitness =
                         outsourcedCost + C1 * selfOwnedFuelCost;
 
@@ -762,8 +820,10 @@ void evaluateFitness(Individual& indiv,
                     tryAddFailedRecord(indiv.failedTruckRecords, rec, 10);
                 }
 
-                // 保留原本邏輯：該 customer 失敗後，後面的 customer 仍可繼續嘗試
-                // 如果你想要「一個 customer 失敗後整台車停止裝載」，這裡才改成 break;
+                // 保留原本邏輯：
+                // 該 customer 失敗後，後面的 customer 仍可繼續嘗試。
+                // 如果想改成「一個 customer 失敗後整台車停止裝載」，
+                // 這裡才改成 break;
             }
         }
 
@@ -1144,25 +1204,103 @@ static void moveCustomerBlockInChromosome(Individual& ind, int movingCid, int be
 // ==============================
 // Helper 3: 重新解碼並重算 fitness
 // ==============================
+
+static void reDecodeAndEvaluate(
+    Individual& ind,
+    const Data& parameters,
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    LoadingCache& loadingCache)
+{
+    std::vector<Individual> one{ind};
+
+    decodePopulation(one, parameters, cargoLookup);
+
+    one[0].fitness.clear();
+    evaluateFitness(one[0], parameters, loadingCache);
+
+    ind = one[0];
+}
 static void reDecodeAndEvaluate(
     Individual& ind,
     const Data& parameters,
     const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
 {
-    std::vector<Individual> one{ind};
-    LoadingCache loadingCache;   // ⭐ 放這裡
-    decodePopulation(one, parameters, cargoLookup);
-
-    one[0].fitness.clear();
-    evaluateFitness(one[0], parameters,loadingCache);
-
-    ind = one[0];
+    LoadingCache tempCache;
+    reDecodeAndEvaluate(ind, parameters, cargoLookup, tempCache);
 }
 static bool betterObj(const Individual& a, const Individual& b, double eps = 1e-9)
 {
     return a.fitness[0] < b.fitness[0] - eps;
 }
+static double estimateOptimisticCostWithoutLoading(
+    const Individual& cand,
+    const Data& parameters)
+{
+    const double C1 = 5.41;
 
+    std::unordered_set<int> customerSetByArea[regionNum + 1];
+
+    for (const auto& g : cand.chromosome) {
+        int cid = g.customerId;
+        int area = g.decodedServiceArea;
+
+        if (area < 1 || area > regionNum) continue;
+        if (parameters.serviceRegion[cid - 1][area - 1] != 1) continue;
+
+        customerSetByArea[area].insert(cid);
+    }
+
+    double optimisticDistance = 0.0;
+
+    for (int area = 1; area <= regionNum; ++area) {
+        if (customerSetByArea[area].empty()) continue;
+
+        std::vector<int> customerSet(
+            customerSetByArea[area].begin(),
+            customerSetByArea[area].end()
+        );
+
+        std::vector<int> routeOrder =
+            buildRouteFromFixedOrder(customerSet, parameters, area);
+
+        if (routeOrder.empty()) continue;
+
+        double dist = 0.0;
+
+        dist += parameters.getDistance(0, routeOrder.front());
+
+        for (int i = 0; i + 1 < (int)routeOrder.size(); ++i) {
+            dist += parameters.getDistance(routeOrder[i], routeOrder[i + 1]);
+        }
+
+        dist += parameters.getDistance(routeOrder.back(), 0);
+
+        optimisticDistance += dist;
+    }
+
+    return C1 * optimisticDistance;
+}
+
+static bool isPromisingNeighbor(
+    const Individual& cand,
+    const Data& parameters,
+    double bestObj,
+    double eps = 1e-9)
+{
+    double optimisticCost =
+        estimateOptimisticCostWithoutLoading(cand, parameters);
+
+    return optimisticCost < bestObj - eps;
+}
+static double calcOutsourceFee(
+    int cid,
+    const Data& parameters)
+{
+    double vol = parameters.totalVolume[cid - 1];
+    int v = (int)std::ceil(vol);
+
+    return 100 + 30 * std::max(0, v - 3);
+}
 static bool doReinsertionOnceStable(
     Individual& ind,
     const Data& parameters,
@@ -1193,12 +1331,15 @@ static bool doReinsertionOnceStable(
 static bool doAreaRebuildForRentedOnce(
     Individual& ind,
     const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    LoadingCache& loadingCache)
 {
     const double EPS = 1e-9;
 
     Individual base = ind;
-    reDecodeAndEvaluate(base, parameters, cargoLookup);
+
+    // 使用 local search 共用的 LoadingCache
+    reDecodeAndEvaluate(base, parameters, cargoLookup, loadingCache);
     if (base.fitness.empty()) return false;
 
     double baseObj = base.fitness[0];
@@ -1286,7 +1427,13 @@ static bool doAreaRebuildForRentedOnce(
                         }
                     }
 
-                    reDecodeAndEvaluate(cand, parameters, cargoLookup);
+                    if (!isPromisingNeighbor(cand, parameters, baseObj, EPS)) {
+                        continue;
+                    }
+
+                    // 使用共用 LoadingCache
+                    reDecodeAndEvaluate(cand, parameters, cargoLookup, loadingCache);
+
                     if (!cand.fitness.empty() && cand.fitness[0] < baseObj - EPS) {
                         ind = std::move(cand);
                         return true;
@@ -1315,7 +1462,13 @@ static bool doAreaRebuildForRentedOnce(
                     }
                 }
 
-                reDecodeAndEvaluate(cand, parameters, cargoLookup);
+                if (!isPromisingNeighbor(cand, parameters, baseObj, EPS)) {
+                    continue;
+                }
+
+                // 使用共用 LoadingCache
+                reDecodeAndEvaluate(cand, parameters, cargoLookup, loadingCache);
+
                 if (!cand.fitness.empty() && cand.fitness[0] < baseObj - EPS) {
                     ind = std::move(cand);
                     return true;
@@ -1348,7 +1501,13 @@ static bool doAreaRebuildForRentedOnce(
                         }
                     }
 
-                    reDecodeAndEvaluate(cand, parameters, cargoLookup);
+                    if (!isPromisingNeighbor(cand, parameters, baseObj, EPS)) {
+                        continue;
+                    }
+
+                    // 使用共用 LoadingCache
+                    reDecodeAndEvaluate(cand, parameters, cargoLookup, loadingCache);
+
                     if (!cand.fitness.empty() && cand.fitness[0] < baseObj - EPS) {
                         ind = std::move(cand);
                         return true;
@@ -1474,10 +1633,12 @@ static bool doExchangeOnce(
 
     return false;
 }
+
 bool doKickOutAndInsertOnce(
     Individual& ind,
     const Data& parameters,
-    const std::unordered_map<int, std::unordered_map<int, Cargo>>& cargoLookup
+    const std::unordered_map<int, std::unordered_map<int, Cargo>>& cargoLookup,
+    LoadingCache& loadingCache
 ) {
     if (ind.rentedTrucks.empty()) return false;
 
@@ -1505,6 +1666,14 @@ bool doKickOutAndInsertOnce(
 
     if (rentedCustomers.empty()) return false;
 
+    // 可選：外包成本高的先試
+    std::sort(rentedCustomers.begin(), rentedCustomers.end(),
+        [&](int a, int b) {
+            return calcOutsourceFee(a, parameters) >
+                   calcOutsourceFee(b, parameters);
+        }
+    );
+
     // 2. collect self-owned customers by area
     std::vector<int> selfCustomersByArea[regionNum + 1];
 
@@ -1527,8 +1696,19 @@ bool doKickOutAndInsertOnce(
 
                 if (kickCid == insertCid) continue;
 
+                double insertFee = calcOutsourceFee(insertCid, parameters);
+                double kickFee   = calcOutsourceFee(kickCid, parameters);
+
+                // 如果換回來的外包節省沒有比較好，就不要做 3D loading
+                if (insertFee <= kickFee + EPS) {
+                    continue;
+                }
+
                 Individual cand = base;
 
+                // 保留你原本 operator 的意思：
+                // 只改 decodedServiceArea，直接交給 evaluateFitness 判斷。
+                // 不在這裡呼叫 decodePopulation，也不要改 undecodedServiceArea。
                 for (auto& g : cand.chromosome) {
 
                     if (g.customerId == insertCid) {
@@ -1539,9 +1719,10 @@ bool doKickOutAndInsertOnce(
                     }
                 }
 
-                LoadingCache tempCache;
-
-                evaluateFitness(cand, parameters, tempCache);
+                // 重點改這裡：
+                // 原本是 LoadingCache tempCache;
+                // 現在改用 local search 共用的 loadingCache。
+                evaluateFitness(cand, parameters, loadingCache);
 
                 if (cand.fitness.empty()) continue;
 
@@ -1566,13 +1747,16 @@ bool doKickOutAndInsertOnce(
 static bool doCrossAreaRelocateOnce(
     Individual& ind,
     const Data& parameters,
-    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup)
+    const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
+    LoadingCache& loadingCache)
 {
     const double EPS = 1e-9;
 
     // baseline
     Individual base = ind;
-    reDecodeAndEvaluate(base, parameters, cargoLookup);
+
+    // 使用 local search 共用的 LoadingCache
+    reDecodeAndEvaluate(base, parameters, cargoLookup, loadingCache);
     if (base.fitness.empty()) return false;
 
     double baseObj = base.fitness[0];
@@ -1582,7 +1766,7 @@ static bool doCrossAreaRelocateOnce(
     unordered_set<int> seenCustomer;
 
     for (int area = 1; area <= regionNum; ++area) {
-        for (const auto& g : ind.selfOwnedTrucks[area].assignedCargo) {
+        for (const auto& g : base.selfOwnedTrucks[area].assignedCargo) {
             if (!seenCustomer.count(g.customerId)) {
                 selfCustomers.push_back({g.customerId, area});
                 seenCustomer.insert(g.customerId);
@@ -1600,6 +1784,7 @@ static bool doCrossAreaRelocateOnce(
         // 找此 customer 的所有 feasible areas
         vector<int> feasibleAreas;
         int customerIdx = cid - 1;
+
         for (int area = 1; area <= regionNum; ++area) {
             if (parameters.serviceRegion[customerIdx][area - 1] == 1) {
                 feasibleAreas.push_back(area);
@@ -1615,7 +1800,7 @@ static bool doCrossAreaRelocateOnce(
             int encodedChoice = encodeServiceAreaChoice(cid, targetArea, parameters);
             if (encodedChoice == -1) continue;
 
-            Individual cand = ind;
+            Individual cand = base;
 
             // 關鍵：改 raw encoding，讓 reDecodeAndEvaluate 真的吃到
             for (auto& g : cand.chromosome) {
@@ -1626,7 +1811,12 @@ static bool doCrossAreaRelocateOnce(
                 }
             }
 
-            reDecodeAndEvaluate(cand, parameters, cargoLookup);
+            if (!isPromisingNeighbor(cand, parameters, baseObj, EPS)) {
+                continue;
+            }
+
+            // 使用 local search 共用的 LoadingCache
+            reDecodeAndEvaluate(cand, parameters, cargoLookup, loadingCache);
             if (cand.fitness.empty()) continue;
 
             if (cand.fitness[0] < baseObj - EPS) {
@@ -1682,14 +1872,18 @@ static void localSearchImproveByRealObjective(
     Individual& ind,
     const Data& parameters,
     const unordered_map<int, unordered_map<int, Cargo>>& cargoLookup,
-    int budgetMoves = 100)
+    int budgetMoves = 30)
 {
     static std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<int> pickOp(0, 3);
 
     const double EPS = 1e-9;
 
-    reDecodeAndEvaluate(ind, parameters, cargoLookup);
+    // ⭐ Local Search 共用同一個 LoadingCache
+    LoadingCache localSearchCache;
+
+    // 一開始先重新 decode + evaluate，並把結果寫入 localSearchCache
+    reDecodeAndEvaluate(ind, parameters, cargoLookup, localSearchCache);
     if (ind.fitness.empty()) return;
 
     double bestObj = ind.fitness[0];
@@ -1708,15 +1902,29 @@ static void localSearchImproveByRealObjective(
             break;
 
         case 1:
-            moved = doCrossAreaRelocateOnce(ind, parameters, cargoLookup);
-            break;
+           moved = doCrossAreaRelocateOnce(
+        ind,
+        parameters,
+        cargoLookup,
+        localSearchCache
+    );
 
         case 2:
-            moved = doAreaRebuildForRentedOnce(ind, parameters, cargoLookup);
+            moved = doAreaRebuildForRentedOnce(
+        ind,
+        parameters,
+        cargoLookup,
+        localSearchCache
+    );
             break;
 
         case 3:
-            moved = doKickOutAndInsertOnce(ind, parameters, cargoLookup);
+           moved = doKickOutAndInsertOnce(
+        ind,
+        parameters,
+        cargoLookup,
+        localSearchCache
+    );
             break;
 
         default:
@@ -1730,8 +1938,10 @@ static void localSearchImproveByRealObjective(
 
         gLocalSearchOpStats[op].returnedTrueCount++;
 
+        // ⭐ 原本這裡是 reDecodeAndEvaluate(ind, parameters, cargoLookup);
+        // 現在改成使用 localSearchCache
         if (op != 3) {
-            reDecodeAndEvaluate(ind, parameters, cargoLookup);
+            reDecodeAndEvaluate(ind, parameters, cargoLookup, localSearchCache);
         }
 
         if (!ind.fitness.empty() && ind.fitness[0] < bestObj - EPS) {

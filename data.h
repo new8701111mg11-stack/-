@@ -59,9 +59,13 @@ struct LoadingCache {
     // area -> setKey -> orderKey 曾出現
     std::vector<std::unordered_map<std::string, std::unordered_set<std::string>>> selfOwnedSeenCache;
 
+    // area -> setKey -> orderKey|tryingCustomer 曾經出現 large violation
+    std::vector<std::unordered_map<std::string, std::unordered_set<std::string>>> selfOwnedLargeViolationCache;
+
     LoadingCache() {
         selfOwnedSuccessCache.resize(regionNum + 1);
         selfOwnedSeenCache.resize(regionNum + 1);
+        selfOwnedLargeViolationCache.resize(regionNum + 1);
     }
 
     void clear() {
@@ -69,6 +73,9 @@ struct LoadingCache {
             mp.clear();
         }
         for (auto& mp : selfOwnedSeenCache) {
+            mp.clear();
+        }
+        for (auto& mp : selfOwnedLargeViolationCache) {
             mp.clear();
         }
     }
@@ -101,6 +108,41 @@ struct LoadingCache {
     void saveSuccess(int area, const std::string& setKey, const std::string& orderKey) {
         if (area < 1 || area > regionNum) return;
         selfOwnedSuccessCache[area][setKey].insert(orderKey);
+    }
+
+    static std::string buildViolationOrderKey(
+        const std::string& orderKey,
+        int tryingCustomer)
+    {
+        return orderKey + "|try=" + std::to_string(tryingCustomer);
+    }
+
+    bool hasLargeViolation(
+        int area,
+        const std::string& setKey,
+        const std::string& orderKey,
+        int tryingCustomer) const
+    {
+        if (area < 1 || area > regionNum) return false;
+
+        const auto& mp = selfOwnedLargeViolationCache[area];
+        auto it = mp.find(setKey);
+        if (it == mp.end()) return false;
+
+        std::string key = buildViolationOrderKey(orderKey, tryingCustomer);
+        return it->second.count(key) > 0;
+    }
+
+    void saveLargeViolation(
+        int area,
+        const std::string& setKey,
+        const std::string& orderKey,
+        int tryingCustomer)
+    {
+        if (area < 1 || area > regionNum) return;
+
+        std::string key = buildViolationOrderKey(orderKey, tryingCustomer);
+        selfOwnedLargeViolationCache[area][setKey].insert(key);
     }
 };
 struct Truck{
